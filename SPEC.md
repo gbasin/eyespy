@@ -164,12 +164,13 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - Additional anti-flake CSS: `caret-color: transparent; scroll-behavior: auto !important`
 - **Browser flags**: Try `--deterministic-mode` first (meta-flag intended to set `--run-all-compositor-stages-before-draw`, `--enable-begin-frame-control`, `--disable-threaded-animation`, `--disable-threaded-scrolling`, `--disable-checker-imaging`, `--disable-image-animation-resync`). **Fallback**: if `--deterministic-mode` is not recognized by the Chromium version bundled with Playwright (verify in Phase 0 PoC), set all 6 component flags individually. Additionally: `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
 - Fixed viewport: 1280x720, deviceScaleFactor: 1
+- **Headless mode**: Use `headless: true` (Playwright's default, which uses the new headless mode since Playwright 1.33). The old headless mode (`headless: 'shell'`) uses a separate headless shell binary with different rendering behavior. The new headless mode uses the same Chromium binary as headed mode — critical for screenshot consistency. Recording uses headed mode (`headless: false`) so the user can interact.
 - **Fresh BrowserContext per session** (NOT a new browser process — reuse the same `Browser` instance for all sessions within a run, create a new `BrowserContext` for each): Each replay session starts with clean state — no localStorage, IndexedDB, cookies, or Service Workers from previous sessions. `browserContext` created with `storageState: undefined`, `serviceWorkers: 'block'`. Smart retry also creates fresh contexts (same browser).
 - **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`. Font loading works correctly with paused clock because: `@font-face` triggers network requests → fulfilled by route handlers (Node.js, real time) → browser font renderer processes data (rendering pipeline, not JS timers) → `document.fonts.ready` resolves. The clock mock only affects JS-level timer APIs, not network completion or rendering.
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
 **Network mocking**: **Targeted route patterns** — route only recorded origins (e.g., `page.route('**/api.stripe.com/**')`) instead of catch-all `**/*`. Catch-all introduces flakiness (#22338).
-- FIFO per URL+method. Unmatched requests: abort (mock mode) or pass through (live mode)
+- **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay. Unmatched requests: abort (mock mode) or pass through (live mode).
 - **WebSocket mocking**: `page.routeWebSocket()` (Playwright 1.48+). Replay recorded frames in order with timing.
 - **SSE mocking**: Replace `EventSource` via `addInitScript()` with a mock that serves recorded events.
 - **CORS preflights**: Cannot intercept (#37245). Document limitation. Mock mode should serve responses without CORS restrictions.
@@ -318,6 +319,24 @@ eyespy sanitize                                   # Strip response bodies for sh
 
 JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 0 = all pass, 1 = diffs detected, 2 = replay failures.
 
+**Machine-readable summary** (`eyespy ci` always writes `.eyespy/runs/latest/summary.json`):
+```json
+{
+  "version": 1,
+  "runId": "abc123",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "playwrightVersion": "1.50.0",
+  "exitCode": 1,
+  "sessions": [
+    { "id": "session-abc", "status": "pass", "screenshots": 5, "diffCount": 0, "durationMs": 3200 },
+    { "id": "session-def", "status": "diff", "screenshots": 4, "diffCount": 2, "durationMs": 4100, "confirmedDiffs": ["002-click-submit", "004-end"] },
+    { "id": "session-ghi", "status": "error", "reason": "Navigation timeout", "durationMs": 30000 }
+  ],
+  "totals": { "sessions": 3, "passed": 1, "diffs": 1, "errors": 1, "screenshots": 9, "diffScreenshots": 2, "durationMs": 37300 }
+}
+```
+Used by CI integrations (PR comments, Slack notifications, dashboards) without parsing CLI text output.
+
 ### 6. Storage (Manifest + Content-Addressable Blobs)
 
 ```
@@ -392,7 +411,8 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "smartRetry": true,
     "mode": "mock",
     "viewport": { "width": 1280, "height": 720 },
-    "seed": "default"
+    "seed": "default",
+    "localDiffThreshold": 0.02
   },
   "storage": {
     "backend": "local",
@@ -492,6 +512,12 @@ Concrete implementation patterns, data structures, and lessons learned from rese
 **Fetch interception** — Direct monkey-patch, NOT ES6 Proxy. Every production recording tool (OpenReplay, Sentry, Highlight.io) replaces `window.fetch` directly. ES6 Proxy adds overhead and breaks `instanceof` checks.
 
 ```typescript
+// Max request/response body size to capture (bytes). Bodies larger than this are truncated,
+// which means body-fingerprinted FIFO matching may not work for very large POST bodies.
+// 64KB covers GraphQL queries (typically < 10KB) and most REST API payloads.
+// File uploads (multi-MB) are intentionally truncated — they're too large to store in session JSON.
+const MAX_BODY_SIZE = 64 * 1024; // 64KB
+
 // Store original before any framework loads
 const _originalFetch = window.fetch.bind(window);
 const _originalXHROpen = XMLHttpRequest.prototype.open;
@@ -843,11 +869,15 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
   page.on('request', (request) => {
     const requestId = `req_${++requestCounter}`;
     requestMap.set(request, { id: requestId, startTime: Date.now() });
+    // IMPORTANT: Capture request body (postData) for body-fingerprinted FIFO matching.
+    // Without this, concurrent POST requests to the same URL (e.g., GraphQL) can't be
+    // distinguished during replay. `request.postData()` returns null for GET/HEAD/DELETE.
+    const body = request.postData() ?? undefined;
     events.push({
       type: 'network', timestamp: relTs(),
       event: {
         type: 'request', requestId, url: request.url(), method: request.method(),
-        headers: sanitizeHeaders(request.headers()), timestamp: relTs(),
+        headers: sanitizeHeaders(request.headers()), body, timestamp: relTs(),
       },
     });
   });
@@ -1096,29 +1126,73 @@ function findResponse(events: RecordedEvent[], requestId: string): NetworkEvent 
   return undefined;
 }
 
-// Build FIFO queues keyed by method + normalized URL
-function buildNetworkQueues(session: RecordedSession): Map<string, NetworkEvent[]> {
-  const queues = new Map<string, NetworkEvent[]>(); // "METHOD:normalizedUrl" → FIFO queue
+// Build network response queues keyed by method + normalized URL + request body fingerprint.
+//
+// CRITICAL: Why body fingerprinting matters for concurrent requests.
+// The naive approach (FIFO keyed by METHOD:URL) breaks when multiple concurrent requests
+// hit the same endpoint — common in GraphQL (all POSTs to /graphql), batch APIs, and
+// polling. If two POST /api/graphql requests arrive in different order during replay
+// vs recording, FIFO returns the wrong response → wrong data renders → false positive diff.
+//
+// Solution: For methods with bodies (POST, PUT, PATCH), include a truncated SHA-256 hash
+// of the request body in the queue key. This gives each unique request its own queue.
+// For bodyless methods (GET, DELETE, HEAD, OPTIONS), use METHOD:URL only (FIFO).
+// If body hashing produces a queue miss (body changed between record/replay), fall back
+// to the METHOD:URL-only queue.
+//
+// Trade-off: This means a request body MUST be recorded to get correct matching. The
+// SDK and Playwright recorder both capture request bodies — but if a body is too large
+// and was truncated, the hash won't match. Truncation threshold (MAX_BODY_SIZE) must be
+// large enough to capture GraphQL queries (typically < 10KB) but small enough to avoid
+// storing multi-MB file uploads. Default: 64KB.
+
+// Uses createHash from 'crypto' (already imported for blob store)
+const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
+
+function requestBodyFingerprint(body: string | undefined): string {
+  if (!body) return '';
+  // Truncated SHA-256 (first 12 hex chars) — enough to distinguish different requests,
+  // short enough to not bloat queue key maps in memory.
+  return createHash('sha256').update(body).digest('hex').substring(0, 12);
+}
+
+function buildNetworkQueues(session: RecordedSession): {
+  bodyQueues: Map<string, NetworkEvent[]>;   // "METHOD:url:bodyHash" → FIFO (for POST/PUT/PATCH)
+  urlQueues: Map<string, NetworkEvent[]>;    // "METHOD:url" → FIFO (fallback, and GET/DELETE/etc.)
+} {
+  const bodyQueues = new Map<string, NetworkEvent[]>();
+  const urlQueues = new Map<string, NetworkEvent[]>();
+
   for (const event of session.events) {
     if (event.type !== 'network' || event.event.type !== 'request') continue;
-    const key = `${event.event.method}:${normalizeUrl(event.event.url)}`;
-    if (!queues.has(key)) queues.set(key, []);
-    // Find matching response
+    const normalUrl = normalizeUrl(event.event.url);
+    const urlKey = `${event.event.method}:${normalUrl}`;
     const response = findResponse(session.events, event.event.requestId);
-    if (response) queues.get(key)!.push(response);
+    if (!response) continue;
+
+    // Always add to URL-only queue (fallback)
+    if (!urlQueues.has(urlKey)) urlQueues.set(urlKey, []);
+    urlQueues.get(urlKey)!.push(response);
+
+    // For body methods, also add to body-fingerprinted queue
+    if (BODY_METHODS.has(event.event.method) && event.event.body) {
+      const bodyKey = `${urlKey}:${requestBodyFingerprint(event.event.body)}`;
+      if (!bodyQueues.has(bodyKey)) bodyQueues.set(bodyKey, []);
+      bodyQueues.get(bodyKey)!.push(response);
+    }
   }
-  return queues;
+  return { bodyQueues, urlQueues };
 }
 
 // Register routes per origin (NOT catch-all)
 async function registerRoutes(
   context: BrowserContext,
-  queues: Map<string, NetworkEvent[]>,  // Pre-built by buildNetworkQueues()
+  queues: { bodyQueues: Map<string, NetworkEvent[]>; urlQueues: Map<string, NetworkEvent[]> },
   mode: 'mock' | 'live',
 ) {
-  // Extract origins from queue keys ("METHOD:https://api.stripe.com/v1/charges" → "https://api.stripe.com")
+  // Extract origins from URL queue keys ("METHOD:https://api.stripe.com/v1/charges" → "https://api.stripe.com")
   const origins = new Set<string>();
-  for (const key of queues.keys()) {
+  for (const key of queues.urlQueues.keys()) {
     const url = key.substring(key.indexOf(':') + 1); // Strip "METHOD:" prefix
     origins.add(new URL(url).origin);
   }
@@ -1127,15 +1201,40 @@ async function registerRoutes(
     // Targeted pattern: only intercept this specific origin
     await context.route(`**/${new URL(origin).host}/**`, async (route) => {
       const request = route.request();
-      const key = `${request.method()}:${normalizeUrl(request.url())}`;
-      const queue = queues.get(key);
+      const normalUrl = normalizeUrl(request.url());
+      const urlKey = `${request.method()}:${normalUrl}`;
 
-      if (queue && queue.length > 0) {
-        const recorded = queue.shift()!;
-        const body = recorded.bodyHash ? await blobStore.get(recorded.bodyHash) : undefined;
+      // Two-tier matching: try body-fingerprinted queue first, fall back to URL-only
+      let matched: NetworkEvent | undefined;
+
+      if (BODY_METHODS.has(request.method())) {
+        const postData = request.postData() ?? '';
+        const bodyKey = `${urlKey}:${requestBodyFingerprint(postData)}`;
+        const bodyQueue = queues.bodyQueues.get(bodyKey);
+        if (bodyQueue && bodyQueue.length > 0) {
+          matched = bodyQueue.shift()!;
+          // Also consume from URL queue to keep them in sync
+          const urlQueue = queues.urlQueues.get(urlKey);
+          if (urlQueue) {
+            const idx = urlQueue.indexOf(matched);
+            if (idx >= 0) urlQueue.splice(idx, 1);
+          }
+        }
+      }
+
+      // Fallback: URL-only FIFO (for GET/DELETE or when body fingerprint doesn't match)
+      if (!matched) {
+        const urlQueue = queues.urlQueues.get(urlKey);
+        if (urlQueue && urlQueue.length > 0) {
+          matched = urlQueue.shift()!;
+        }
+      }
+
+      if (matched) {
+        const body = matched.bodyHash ? await blobStore.get(matched.bodyHash) : undefined;
         await route.fulfill({
-          status: recorded.status,
-          headers: recorded.headers,
+          status: matched.status,
+          headers: matched.headers,
           body,
         });
       } else if (mode === 'mock') {
@@ -1402,8 +1501,8 @@ async function replaySession(
   //    (Stripe, S3), those URLs are the same in recording and replay. The app origin
   //    routes are NOT intercepted — those go to the real replay server at targetUrl.
   //    Only third-party API traffic flows through the mock.
-  const queues = buildNetworkQueues(session);
-  await registerRoutes(context, queues, options.mode);
+  const networkQueues = buildNetworkQueues(session);
+  await registerRoutes(context, networkQueues, options.mode);
 
   // 4. Create page, install clock BEFORE any navigation
   const page = await context.newPage();
@@ -1465,7 +1564,7 @@ async function replaySession(
     // Dispatch the interaction
     totalInteractions++;
     try {
-      await dispatchInteraction(page, event, healingLog);
+      await dispatchInteraction(page, event, healingLog, remapUrl);
     } catch (e) {
       failedInteractions++;
       healingLog.push({ event, error: e.message, skipped: true });
@@ -1525,7 +1624,7 @@ async function captureStableScreenshot(page: Page, maxAttempts = 5, timeoutMs = 
  * Map recorded events to Playwright actions.
  * Auto-healing: try primary selector, then fallback cascade.
  */
-async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog: HealingEvent[]): Promise<void> {
+async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog: HealingEvent[], remapUrl: (url: string) => string): Promise<void> {
   switch (event.type) {
     case 'click': {
       const locator = await resolveSelector(page, event.selector, healingLog);
@@ -1677,8 +1776,8 @@ function createUrlRemapper(recordedBaseUrl: string, replayBaseUrl: string) {
     } catch { return url; }
   };
 }
-// Note: `remapUrl` is created by the orchestrator caller and passed to dispatchInteraction
-// via closure or options. The initial page.goto also uses it.
+// Note: `remapUrl` is created inside `replaySession()` and passed as a parameter to
+// `dispatchInteraction()`. The initial page.goto also uses it. Never access via closure.
 
 // Build branch index from extracted branches for session skipping
 function buildBranchIndex(branches: Array<{ scriptUrl: string; start: number; end: number }>): BranchIndex {
@@ -2374,6 +2473,52 @@ jobs:
 
 `--ipc=host` is critical — Docker's default 64MB `/dev/shm` crashes Chromium. Alternative: `--shm-size=1gb`. Use `if: ${{ !cancelled() }}` (not `if: always()`) for artifact upload.
 
+**PR comment workflow (Phase 1a — no server needed)**:
+
+Even without the Phase 2 server, teams need visual diff feedback in PRs. A lightweight GitHub Action step posts a PR comment with results:
+
+```yaml
+      - name: Comment PR with Eyespy results
+        if: ${{ github.event_name == 'pull_request' && !cancelled() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('.eyespy/runs/latest/summary.json', 'utf8'));
+            const total = result.sessions.length;
+            const passed = result.sessions.filter(s => s.status === 'pass').length;
+            const failed = result.sessions.filter(s => s.status === 'diff').length;
+            const errors = result.sessions.filter(s => s.status === 'error').length;
+
+            const icon = failed > 0 ? '🔴' : '🟢';
+            const body = [
+              `## ${icon} Eyespy Visual Regression: ${passed}/${total} passed`,
+              failed > 0 ? `**${failed} sessions with visual diffs** — [View Report](${process.env.REPORT_URL})` : '',
+              errors > 0 ? `⚠️ ${errors} replay errors` : '',
+              '',
+              '| Session | Status | Diff |',
+              '|---------|--------|------|',
+              ...result.sessions.map(s =>
+                `| ${s.id.substring(0,8)} | ${s.status === 'pass' ? '✅' : s.status === 'diff' ? '❌' : '⚠️'} | ${s.diffCount || 0} screenshots |`
+              ),
+              '',
+              `📦 [Download full report](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+            ].filter(Boolean).join('\n');
+
+            // Update existing comment or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number
+            });
+            const existing = comments.find(c => c.body.includes('Eyespy Visual Regression'));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+```
+
+This provides immediate feedback in PRs without any server infrastructure. The full HTML report is available as a GitHub Actions artifact.
+
 ### Build Toolchain & SDK Bundling
 
 **esbuild for recorder-sdk** — IIFE format, ES2020 target (NOT ES5):
@@ -2579,32 +2724,81 @@ Set `resetOnNavigation: false` to accumulate coverage across SPA navigations wit
 
 **Variable fonts warning**: Inter Variable and similar variable fonts have known rendering differences in Docker (Playwright #29596). Prefer static font files for visual testing.
 
+### Playwright Version Pinning Strategy
+
+**The problem**: Playwright releases monthly. Each release bundles a NEW Chromium version. New Chromium versions change rendering behavior — subpixel rounding, font metrics, compositing algorithms, GPU rasterization. This means **upgrading Playwright can break ALL existing baselines**, even when the app hasn't changed. For visual regression testing, this is catastrophic — users see 100% of screenshots fail and lose trust in the tool.
+
+**Pinning requirements**:
+1. Pin `@playwright/test` to an EXACT version in `package.json` (e.g., `"1.50.0"`, NOT `"^1.50.0"`)
+2. Pin the Docker image to the matching version (`mcr.microsoft.com/playwright:v1.50.0-noble`)
+3. Store the Playwright version in `.eyespy/config.json` for validation at runtime
+4. On `eyespy ci`: compare the installed Playwright version against `config.json` — warn if mismatched
+
+**Upgrade workflow** (when teams decide to upgrade Playwright):
+1. `npm install @playwright/test@latest` + update Docker image tag
+2. Run `eyespy ci --url <url>` — all baselines will likely fail (Chromium rendering changed)
+3. Review diffs to confirm they're rendering-only (not real regressions): `eyespy diff --report`
+4. `eyespy approve` to accept new baselines with the new Chromium renderer
+5. Commit updated `baselines.json` + `package.json` + `config.json` together
+6. This is a known "baseline reset" — document it in the commit message
+
+**Risk**: Teams may fear upgrading and stay on stale Playwright versions, missing security patches and features. Mitigation: Eyespy release notes should document which Playwright versions are tested and whether a baseline reset is expected.
+
+**Minimum Playwright version**: 1.48 (required for `clock.install()` with #31924 fix, `routeWebSocket()`, and `animations: 'disabled'` as screenshot option).
+
 ---
 
 ## Build Sequence
 
-### Phase 0: Proof of Concept (1-2 days, 1 developer)
+### Phase 0: Proof of Concept (2-3 days, 1 developer)
 
-**Goal**: Validate that deterministic replay produces pixel-identical screenshots.
+**Goal**: Validate that deterministic replay produces pixel-identical screenshots across 5+ app archetypes that stress different aspects of the determinism stack.
 
-Single file (`proof-of-concept.ts`, ~300 lines) that:
+The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a determinism matrix. Each app archetype targets a specific risk. If ANY archetype produces non-identical screenshots across 10 runs, we stop and investigate before committing to the architecture.
+
+**Shared setup** (all archetypes):
 1. Launches Playwright, tests `--deterministic-mode` flag — if Chromium rejects it, fall back to the 6 individual compositor flags. **Log which path was taken.**
 2. Injects PRNG seeding via `addInitScript()` (Math.random, crypto.randomUUID, crypto.getRandomValues)
 3. Installs `clock.install()` with fixed time + patches for `document.timeline.currentTime` and `MessageChannel`
-4. **Test A**: Navigate to TodoMVC React (tests React 18 MessageChannel scheduler), perform 5 hardcoded actions, take screenshots after each with DOM settle-wait (Node.js orchestrated polling)
-5. **Test B**: Navigate to a page with `crypto.randomUUID()` + animated CSS + `Date.now()` display — verify all are deterministic
-6. Runs each test 10 times in Docker
-7. Compares all screenshots with pixelmatch
-8. Reports: 0 diff pixels = success. Any diff = log which screenshot and which pixels differ for debugging.
+4. Takes screenshots with Node.js orchestrated polling (waitForDomSettle) + stabilization loop
+5. Runs 10 times in Docker, compares with pixelmatch (0 diff pixels required)
 
-**Exit criteria**: 10/10 runs produce pixel-identical screenshots in the Playwright Docker image for BOTH test apps.
+**App archetypes** (each targets a different determinism risk):
+
+| # | App | What it stresses | Risk being validated |
+|---|-----|-----------------|---------------------|
+| A | **TodoMVC React 18** | React concurrent scheduler (MessageChannel), `useState`/`useReducer` batching | MessageChannel mock routes through `setTimeout(fn,0)` — does React 18 still render deterministically when its scheduler can't distinguish MessageChannel priority from setTimeout priority? |
+| B | **CSS-in-JS app** (Emotion + styled-components) | Runtime CSS class name generation, style injection order | Emotion uses `murmurhash2` on style content — deterministic IF same styles injected in same order. Styled-components uses counter-based class names — deterministic IF component tree evaluates in same order. PRNG seeding doesn't affect these (they don't use Math.random), but concurrent rendering could change evaluation order. |
+| C | **MUI DataGrid** (Material UI) | Complex component library with internal animations, transitions, portals, Popper.js positioning, intersection observers | Component libraries often use `requestAnimationFrame`, `setTimeout` for positioning, `ResizeObserver` for layout. Tests that the anti-flake stack + clock mocking handles complex real-world UI libraries. |
+| D | **Date picker** (react-datepicker or Day.js calendar) | `Date`, `Intl.DateTimeFormat`, locale-dependent formatting | Validates that `clock.install()` + locale determinism produces identical calendar renders. Many date libraries cache `Date.now()` at import time — PRNG/clock seeding must run before the library imports. |
+| E | **Randomness-heavy page** | `crypto.randomUUID()`, `Math.random()`, animated CSS, CSS transitions, `Date.now()` display, `performance.now()` measurements | Kitchen sink test for the PRNG + clock + animation stack. Includes both `setTimeout`-based animation and CSS `@keyframes` animation. |
+| F | **Next.js 14 app router** (optional, if setup time < 1 hour) | SSR hydration, React Server Components, streaming HTML, client components with `useId()` | `useId()` generates deterministic IDs based on component tree position — should be stable. Streaming HTML means the page builds incrementally — DOM settle detection must handle this. |
+
+**Test procedure per archetype**:
+1. Navigate to the app
+2. Perform 3-5 hardcoded interactions (add todo, open date picker, sort grid, etc.)
+3. Take screenshot after each interaction (with DOM settle + stabilization)
+4. Repeat 10 times with same seed in Docker
+5. pixelmatch all 10 runs — 0 diff pixels for ALL screenshots
+
+**Exit criteria**: 10/10 runs produce pixel-identical screenshots in the Playwright Docker image for ALL archetypes A-E. Archetype F is stretch goal.
+
+**Failure protocol**: If an archetype fails:
+1. Log which screenshot and which pixel coordinates differ
+2. Save diff images for visual inspection
+3. Bisect: disable determinism features one-by-one to isolate the source
+4. If the failure is in a specific library (e.g., MUI), determine if it's fixable (add another mock) or fundamental (need different approach)
+5. **Do not proceed to Phase 1a** with unresolved failures — each archetype validates a real-world scenario that users will encounter
 
 **Risks being validated** (any failure = stop and investigate before proceeding):
 - Deterministic replay with Playwright's stack (no Chromium fork)
 - `clock.install()` + `MessageChannel` patch works with React 18 scheduler
+- CSS-in-JS class generation is deterministic (same styles → same class names across runs)
+- Complex component libraries (MUI, date pickers) render identically under the anti-flake stack
 - Node.js orchestrated polling works with paused clock
 - `--deterministic-mode` or individual compositor flags produce stable screenshots
-- PRNG seeding catches `crypto.randomUUID()` before any page JS
+- PRNG seeding catches `crypto.randomUUID()` / `crypto.getRandomValues()` before any page JS
+- SSR hydration + streaming HTML settles deterministically (if archetype F included)
 
 ---
 
@@ -2686,8 +2880,9 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 
 ---
 
-### Phase 2: Server + Dashboard + GitHub Integration (6-8 weeks)
+### Phase 2: Server + Dashboard + GitHub + Storybook (6-8 weeks)
 
+- **Storybook integration**: `eyespy storybook` command — connects to Storybook's test runner, treats each story as a recording session (navigate to story → screenshot). Leverages coverage-based pruning to skip unchanged stories. Competes directly with Chromatic's TurboSnap but local-first and free. Integration architecture: use `@storybook/test-runner` (Playwright-based) as a peer dependency, inject Eyespy's determinism stack into the test runner's browser context.
 - Fastify REST API with GitHub OAuth + RBAC
 - PostgreSQL 16 + Drizzle (normalized schema — NO JSONB arrays for events)
 - BullMQ + Redis workers with checkpointing + graceful shutdown
@@ -2739,6 +2934,7 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 | Shadow DOM invisible | P1 | Document limitation. Open shadow DOM partially supported. |
 | Streaming/chunked responses | P1 | Buffer to string for replay. `route.fulfill()` cannot stream. Document behavioral difference. |
 | Third-party scripts in coverage | P1 | Filter by URL prefix matching app origin (`script.url.startsWith(appOrigin)`). |
+| **FIFO queue parallel request misordering** | P0 | Two concurrent POST /api/graphql requests get the same `METHOD:URL` key. If they arrive in different order during replay, FIFO returns the wrong response → false positive diff. Fix: two-tier matching — body-fingerprinted queue for POST/PUT/PATCH (truncated SHA-256 of request body), falling back to URL-only FIFO. Already implemented in `buildNetworkQueues` / `registerRoutes`. Validated in Phase 0 PoC with concurrent request test. |
 | **FIFO queue depletion on smart retry** | P0 | `.shift()` consumes queue entries. Each retry needs fresh browser context + rebuilt queues from original session data. Validated by architecture: `replaySession()` is a pure function of (session, seed). |
 | **WS/SSE handlers run in Node.js (WS) or browser with frozen clock (SSE)** | P0 | WS: `routeWebSocket` handlers use real timers, not mocked clock. SSE: `addInitScript` mock uses browser `setTimeout` which is frozen. Solution for both: clock-coordinated delivery — store pending messages, deliver via replay orchestrator synchronized with `clock.runFor()`. |
 | **Source maps unavailable for session skipping** | P1 | Session skipping requires source maps to map scriptUrl → localFilePath. Production builds often strip source maps. Fallback: warn and replay all sessions. Document that `--enable-source-maps` or serving `.map` files is required for session skipping to work. |
@@ -2747,10 +2943,29 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 | **V8 source hash non-determinism across rebuilds** | P1 | Modern bundlers are NOT deterministic (chunk hashing, timestamps). Use `sourceContentHash` from `page.coverage.stopJSCoverage()` output — hash V8's actual executed scripts, not build artifacts. |
 | **CI cold start (missing blobs)** | P1 | `baselines.json` in git but blobs are local. Auto-detect missing blobs, warn, treat all screenshots as "new" (exit 0). Suggest `eyespy pull-baselines`. |
 | **Page-level event listener interference** | P1 | Recorder uses capture-phase `addEventListener` on `document`. Apps that call `stopImmediatePropagation()` on capture phase can block event recording. Mitigation: inject listeners as the very first script via `addInitScript()` — our listeners register before any app code. If still missed, log a warning about uncaptured interactions. |
+| **CSS-in-JS class name non-determinism** | P1 | Emotion uses `murmurhash2(styleContent)` — deterministic for same content. Styled-components uses a counter-based class name — deterministic if components evaluate in same order. Tailwind (utility-first) is not affected. Risk: React concurrent mode's time-slicing could change component evaluation order → different styled-components counter → different class names → layout shift. Mitigation: Our `MessageChannel` mock forces React's scheduler into a predictable sequence. Phase 0 PoC archetype B validates this. If it fails, fallback: force React into synchronous mode via `ReactDOM.flushSync` wrapper (documented workaround for users). |
+| **React 18 concurrent rendering + MessageChannel mock** | P1 | We mock `MessageChannel.postMessage` to route through `setTimeout(fn, 0)`. React 18's scheduler uses MessageChannel specifically for its "between frames" priority (higher than setTimeout). Routing through setTimeout changes scheduling priority — React batches differently → potentially different component tree at screenshot time. Risk is theoretical — our clock mock freezes ALL timers anyway, so priority doesn't matter when clock is paused. But during `clock.runFor()`, setTimeout callbacks fire in registration order, which may differ from MessageChannel's "fire before rAF" semantics. Phase 0 validates. |
+| **Playwright version upgrade breaks all baselines** | P1 | Each Playwright release bundles a new Chromium. New Chromium = different rendering. Upgrading Playwright requires a full baseline reset (`eyespy approve`). Document the upgrade workflow. Pin exact versions. Warn on version mismatch in `eyespy ci`. |
 | **Web Workers bypass PRNG seeding** | Scoped out | `addInitScript()` only runs in main page context. Workers that call `crypto.getRandomValues()` or `Math.random()` get real random values. Most SPAs don't use Workers for UUID generation. Document limitation. Phase 1b: investigate `worker.evaluate()` for dedicated workers. Shared/Service Workers are already blocked. |
 | Canvas/WebGL non-deterministic | Scoped out | Document limitation. Mask canvas regions in diffs. |
 | Cross-origin iframes invisible | Scoped out | Document limitation. Same-origin iframes supported. |
 | Service Workers bypass everything | Scoped out | Block SWs during replay (`serviceWorkers: 'block'`). |
+
+---
+
+## Existential Risks (What Kills This Project)
+
+These are not P0/P1 implementation risks — they're strategic risks that could make the entire product concept unviable.
+
+1. **Determinism is fundamentally unachievable without a Chromium fork.** If Phase 0 PoC shows > 2% false positive rate across the archetype matrix even with the full anti-flake stack, the "good enough determinism" bet fails. Meticulous forked Chromium for a reason. Mitigation: smart retry absorbs some flakiness, and pixel thresholds absorb rendering variance. If PoC false positives are 2-5%, we might survive with higher thresholds + smart retry. If > 5%, the product doesn't work.
+
+2. **Nobody records sessions.** The recording step is friction. Developers might prefer writing Playwright tests directly (they already know how) over recording sessions. Meticulous solved this with production recording (zero developer effort) — we can't do that in Phase 1 (SDK is Phase 1b). If Phase 1a's Playwright recorder feels clunky compared to writing `toHaveScreenshot()` assertions, adoption stalls. Mitigation: The `eyespy record --url` UX must be effortless. Phase 1b's SDK enables production/staging recording.
+
+3. **Coverage-based test selection doesn't reduce enough.** The value proposition depends on "record 50 sessions, we auto-select the 8 that matter." If the greedy set cover algorithm can't achieve < 20% selection ratio with > 70% coverage, the feature doesn't justify the complexity. Mitigation: validate with real-world apps in Phase 1b. If coverage overlap is low (each session covers unique branches), the algorithm works. If overlap is high (all sessions cover the same hot paths), selection doesn't help much.
+
+4. **Playwright changes break us.** Monthly Playwright releases can change clock behavior, route interception, screenshot APIs. A single breaking change could require weeks of debugging and a forced baseline reset for all users. Mitigation: pin exact versions, extensive test suite against Playwright internals, document upgrade path.
+
+5. **The "just use Chromatic" objection.** Chromatic has Storybook integration, cloud infrastructure, team features, and a free tier for small projects. "Why would I use a CLI tool when Chromatic just works?" Mitigation: self-hosted/local-first for teams that can't use cloud services + the record/replay workflow for teams that don't use Storybook.
 
 ---
 
@@ -2763,12 +2978,53 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 5. **Phase 2 PostgreSQL schema**: Design the server-side schema during Phase 1b even if not implemented until Phase 2. Retrofitting a schema onto an existing CLI data model causes impedance mismatch.
 6. **Replay target URL differs from recording URL**: Sessions record against `http://localhost:3000` but CI may use a different host/port (Docker networking, preview deployments). **Phase 1a solution**: `eyespy replay --url http://ci-container:3000` extracts the origin from the recorded session (`session.url`) and from the `--url` flag, then applies origin substitution to: (a) the initial `page.goto()` URL, (b) all `navigate` event URLs, (c) FIFO queue keys (remap recorded origin to replay origin). Network mocking routes remain targeted by recorded *third-party* origins (Stripe, S3, etc.) which don't change. Only the *app origin* is remapped. **Phase 1b**: configurable multi-origin URL mapping in config for complex setups (e.g., API gateway on different host than frontend).
 7. **Concurrent recording + replay**: Can a user record new sessions while replaying old ones? Currently no resource conflict (different browser instances), but both write to `.eyespy/blobs/` — blob store's atomic write (write → rename) handles this safely. Document as supported.
+8. **Local development workflow (non-Docker)**: Developers will run `eyespy` locally before committing. Local screenshots will differ from Docker CI screenshots (different OS font rendering, GPU, display). How do we handle this?
+   - **Recording**: Always local (headed browser). No Docker needed.
+   - **Replay (local)**: Run with `--local` flag (or auto-detect non-Docker). Use **lenient diff thresholds** (`maxDiffPixelRatio: 0.02` locally vs `0.005` in CI). Report diffs but don't fail — print `"Local replay: 3 screenshots differ from baselines (expected — local rendering differs from CI Docker). Run in Docker for authoritative results."`
+   - **Replay (CI)**: Docker mandatory. Strict thresholds. Exit code 1 on diff.
+   - **`eyespy approve`**: Refuse by default on non-Docker (`--force` override). Baselines MUST be generated in Docker for cross-machine consistency.
+   - **Quick local check**: `eyespy replay --local --url http://localhost:3000` runs replay, captures screenshots, diffs with lenient thresholds, generates report. Developers use this to quickly check if their changes look right — not for authoritative pass/fail.
+   - **Docker for local authoritative checks**: `docker run --rm -v $(pwd):/work -w /work mcr.microsoft.com/playwright:v1.50.0-noble npx eyespy ci --url http://host.docker.internal:3000`. Document this in `eyespy init` output.
 
 ## PRNG Design Note
 
 Two PRNG variants are used for different contexts:
 - **xoshiro128\*\*** (32-bit, 4x32-bit state): Injected into browser pages via `addInitScript()`. JS lacks native 64-bit integers, so 32-bit is correct. Used for `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID` seeding.
 - **xoshiro256\*\*** (64-bit, 4x64-bit state): Used in Node.js for `@eyespy/shared` PRNG module. Powers the `derive()` function for independent child PRNG streams (one per session, one per subsystem). Uses BigInt for full 64-bit precision.
+
+---
+
+## Competitive Landscape & Moat Analysis
+
+**Threat 1: Playwright's built-in `toHaveScreenshot()`**
+Playwright already has visual regression testing. Why would anyone use Eyespy?
+- `toHaveScreenshot()` requires writing test scripts manually. Eyespy auto-generates tests from recorded sessions.
+- Playwright's approach is one-screenshot-per-assertion. Eyespy captures entire user flows with coverage-guided selection.
+- No coverage-based test pruning, no session skipping, no smart retry in Playwright's built-in.
+- **Risk**: If Playwright adds recording → replay → screenshot, Eyespy is dead. Probability: low (Playwright team is focused on the test framework, not recording SaaS features).
+- **Moat**: Coverage-based test selection is the real differentiator. "Record once, auto-select minimal test suite, skip unaffected sessions" is a workflow Playwright can't replicate without building a test generation engine.
+
+**Threat 2: Meticulous open-sourcing**
+Meticulous could open-source their core (unlikely — VC-funded, $12M raised) or a competitor could clone their approach.
+- **If Meticulous open-sources**: They have a custom Chromium fork for determinism. We use vanilla Playwright. Their approach is more robust for determinism but harder to maintain. We'd compete on "no custom browser" simplicity.
+- **If another startup enters**: First-mover in open-source matters. Having a working CLI with `npm install` adoption before a competitor launches is the moat.
+- **Moat**: MIT license + CLI-first (no server required) + coverage-based selection. The combination doesn't exist.
+
+**Threat 3: Chromatic / Storybook ecosystem**
+Chromatic dominates Storybook visual testing. If Eyespy doesn't integrate with Storybook, it loses the largest potential audience.
+- **Phase 2+ opportunity**: `eyespy storybook` command that records each story as a session. Integrates with Storybook's test runner. Leverages coverage-based pruning to skip unchanged stories (similar to TurboSnap).
+- **Differentiation from Chromatic**: Chromatic is cloud-only ($149+/mo for teams). Eyespy is local-first, free, self-hosted.
+
+**Threat 4: AI-powered visual testing (Applitools, Percy)**
+These tools use AI/ML for "visual AI" diffing instead of pixel comparison. Smarter but expensive and cloud-dependent.
+- **Our approach**: Pixel comparison is deterministic, reproducible, and free. Smart retry handles flakiness. Pixel thresholds + region masking handle intentional changes.
+- **Not competing on AI diffing** — competing on the recording → replay → auto-test-selection pipeline.
+
+**Strategic priorities for adoption**:
+1. **Phase 1 must nail the developer experience.** `npx eyespy record` → `npx eyespy ci` → HTML report. If this takes more than 15 minutes, developers won't adopt.
+2. **Phase 1b's coverage-based test selection is the moat.** This is what makes Eyespy more than "yet another screenshot diffing tool."
+3. **Storybook integration is table-stakes for Phase 2.** Without it, we miss the largest visual testing market.
+4. **Self-hosted/local-first is the wedge against all cloud competitors.** Teams that can't send code to third-party services (fintech, healthcare, government) have no good option today.
 
 ---
 
@@ -2787,11 +3043,11 @@ Two PRNG variants are used for different contexts:
 ## Verification Plan
 
 **Phase 0:**
-1. **Determinism test**: Replay same 5-action sequence 10 times in Docker. Assert 0 diff pixels across all runs. This is the go/no-go gate.
+1. **Determinism matrix**: Run 5+ app archetypes (TodoMVC React 18, CSS-in-JS, MUI DataGrid, date picker, randomness-heavy page) 10 times each in Docker. Assert 0 diff pixels across all runs for all archetypes. This is the go/no-go gate. Optional archetype F (Next.js 14) is stretch goal.
 
 **Phase 1a:**
 2. **Unit tests**: Selector generation, event serialization, network route matching, PRNG seeding, DOM settle detection, pixelmatch integration, HTML report generation
-3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt), URL normalization for FIFO matching (trailing slashes, default ports, query param ordering), **timestamp convention** (verify all recorders produce relative-offset timestamps, NOT epoch ms), **URL remapping** (verify navigate events use remapped URLs when `--url` differs from recorded origin)
+3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt), URL normalization for FIFO matching (trailing slashes, default ports, query param ordering), **timestamp convention** (verify all recorders produce relative-offset timestamps, NOT epoch ms), **URL remapping** (verify navigate events use remapped URLs when `--url` differs from recorded origin), **body-fingerprinted FIFO matching** (two concurrent POST /api/graphql with different bodies → correct response served regardless of arrival order), **Playwright version mismatch warning** (verify eyespy ci warns when installed Playwright differs from config.json)
 3b. **Playwright recorder tests**: Record a 10-action sequence on TodoMVC via page-level event capture, verify all events captured with correct selectors (including events inside open Shadow DOM), verify network bodies stored in blob store, verify round-trip (record → save → load → replay produces matching screenshots), verify recording overlay is excluded from captures
 4. **E2E test**: Record session on TodoMVC → replay → diff → approve baselines → change CSS → replay → detect diff → approve new baselines
 5. **Determinism regression**: 10-run identical screenshot assertion runs in CI on every commit

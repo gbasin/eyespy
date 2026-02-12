@@ -206,15 +206,25 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 
 **Screenshot timing** (tiered strategy):
 - **Always capture**: After navigations (URL changes, route transitions), after end of session (final state)
-- **Capture with stabilization**: After clicks/submits that trigger visible state changes (detected via MutationObserver firing within 500ms of the event)
+- **Capture with stabilization**: After clicks/submits that trigger significant DOM changes. Detection heuristic: MutationObserver within 500ms of the event must see **structural mutations** (childList additions/removals of non-trivial nodes, i.e., elements with children or text content > 10 chars) OR **navigation/route changes**. Attribute-only mutations (class/style changes from focus, hover, `:active`) are excluded — these are cosmetic, not state changes. Form submissions (`<form>` submit event) always trigger capture regardless of DOM mutations.
 - **Skip**: Individual keystrokes mid-input (wait for blur/submit), mouse moves, hovers, scroll events (unless they trigger lazy loading)
 - **Stabilization loop** (Playwright/Chromatic pattern): After dispatching event and waiting for DOM settle, take screenshot A. Wait 100ms. Take screenshot B. If A === B (pixel-identical), use B. If different, repeat (max 5 attempts or 3s timeout). This absorbs remaining compositor/rendering timing variance.
 - **Clock lifecycle per screenshot**: `clock.pauseAt()` before capture (freeze all timers), take stabilized screenshot, `clock.resume()` before next interaction.
 - Configurable via `screenshotStrategy` in config: `"tiered"` (default), `"every"` (every event), `"manual"` (only explicit `screenshot-marker` events)
 
-**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times for those specific screenshots. Majority vote (2-of-3). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.**
+**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times to confirm. Majority vote (2-of-3 must show diff for it to count). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.**
 
-**Coverage collection**: `page.coverage.startJSCoverage({ resetOnNavigation: false })`. Extract branch-level bitmap. Version-stamp with `bundleContentHash` (NOT git SHA — git SHA changes every commit but the bundle may be identical). Only invalidate bitmaps when the bundle content actually changes. `resetOnNavigation: false` accumulates coverage across SPA navigations within a session.
+**Fresh context per retry** (critical implementation detail): FIFO network queues are consumed by `.shift()` during replay — after the first replay, all queues are empty. Each retry attempt MUST:
+1. Create a fresh `BrowserContext` (no shared state from previous attempt)
+2. Rebuild FIFO queues from the original session data (`buildNetworkQueues(session)`)
+3. Re-register all routes on the new context
+4. Re-inject PRNG seed and clock (deterministic — same seed produces same sequence)
+
+This means the retry function signature is: `replaySession(session, seed) → screenshots[]`. The orchestrator calls it up to 3 times for sessions with diffs, each call is fully independent. The orchestrator only compares specific screenshots that diffed, not the entire session.
+
+**Coverage collection**: `page.coverage.startJSCoverage({ resetOnNavigation: false })`. Extract branch-level bitmap. Version-stamp with `sourceContentHash` — SHA-256 of the concatenated `entry.source` strings from coverage output. This hashes what V8 actually executed, not build artifacts. Modern bundlers (webpack, vite, esbuild) are NOT deterministic between builds — same source can produce different output due to chunk hashing, timestamps, parallel processing artifacts. Hashing V8's script source at runtime eliminates this problem entirely. Only invalidate bitmaps when the source hash changes. `resetOnNavigation: false` accumulates coverage across SPA navigations within a session.
+
+**Coverage limitation (mocked network)**: V8 coverage tracks which branches execute. With network mocking, responses come from FIFO queues, not real servers. If the app has different code paths for different response shapes/timings/errors, coverage won't capture all production paths. This is inherent — coverage reflects the recorded session's behavior, not all possible behaviors. Document this to users.
 
 **DOM settle detection**: MutationObserver + requestAnimationFrame drain. Wait for 300ms of no DOM changes. Also wait for `document.fonts.ready`, `img.complete` on visible images, and rAF drain (two frames). **Clock interaction**: The settle detection runs inside `page.evaluate()` where `Date.now()` is mocked. Use `page.waitForTimeout()` (real time) as the outer timeout wrapper to prevent hangs when clock is paused.
 
@@ -224,7 +234,7 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 
 **Algorithm**:
 1. For each recorded session: replay with V8 coverage ON, extract branch-level coverage bitmap
-2. Version-stamp bitmap with `(gitSha, bundleContentHash)`
+2. Version-stamp bitmap with `(gitSha, sourceContentHash)`
 3. Deduplicate: sessions with identical bitmaps → keep one (same flow, different data)
 4. Greedy set cover: iteratively select session covering most uncovered branches
 5. Stop when target coverage reached (default 100% of reachable branches)
@@ -332,6 +342,13 @@ eyespy push-baselines              # Upload baseline blobs to remote
 eyespy pull-baselines              # Download baseline blobs from remote
 ```
 Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash), has(hash) }`. Built-in: local filesystem (default), S3-compatible (AWS S3, Cloudflare R2, MinIO, Backblaze B2). Designed following reg-suit's plugin architecture.
+
+**CI cold start (missing blobs)**: When `baselines.json` exists (git-tracked) but referenced blob files are missing (new developer clone, fresh CI without `pull-baselines`), auto-detect and handle gracefully:
+1. On `eyespy ci` / `eyespy diff`: Check if all hashes in `baselines.json` exist in local blob store
+2. If any missing: print warning `"⚠ N baseline blobs missing. Run 'eyespy pull-baselines' or 'eyespy approve' to establish local baselines. Treating all screenshots as new."`
+3. Treat all screenshots as "new" (no diff possible), exit 0 (not exit 1 — missing blobs aren't a regression)
+4. If remote storage is configured but `pull-baselines` wasn't run: suggest `eyespy pull-baselines` in the warning
+5. First `eyespy approve` after a fresh clone populates the blob store from current screenshots
 
 **Dedup**: All binary artifacts stored by SHA-256 hash. Same screenshot across runs stored once. **Expected savings: 60-80%.**
 
@@ -616,6 +633,192 @@ function verifyInterception(): { fetch: boolean; xhr: boolean; ws: boolean } {
 // Call after DOMContentLoaded, warn if any are false
 ```
 
+### Playwright Recorder: CDP-Based Event Capture
+
+The CLI recorder (`eyespy record --url`) uses Playwright's CDP session to listen for raw browser input events — the same mechanism Playwright's codegen uses internally. This captures events at the browser level, not the page level, so it works regardless of page JavaScript, Shadow DOM, or framework quirks.
+
+```typescript
+async function startRecording(page: Page): Promise<RecordedEvent[]> {
+  const events: RecordedEvent[] = [];
+  const cdp = await page.context().newCDPSession(page);
+
+  // Enable DOM domain for element resolution
+  await cdp.send('DOM.enable');
+
+  // Listen for mouse events at the Input domain level
+  cdp.on('Input.dispatchMouseEvent', async (params) => {
+    if (params.type !== 'mousePressed') return; // Only record clicks, not moves
+
+    // Resolve (x, y) coordinates to a DOM node
+    const { nodeId } = await cdp.send('DOM.getNodeForLocation', {
+      x: Math.round(params.x),
+      y: Math.round(params.y),
+      includeUserAgentShadowDOM: false,
+    });
+
+    // Get node attributes for selector generation
+    const { node } = await cdp.send('DOM.describeNode', { nodeId, depth: 0 });
+
+    // Generate selector bundle from the resolved node
+    const selector = await generateSelectorFromNode(page, cdp, nodeId, node);
+
+    events.push({
+      type: 'click',
+      timestamp: Date.now(),
+      selector,
+      x: params.x,
+      y: params.y,
+      button: params.button || 0,
+      modifiers: {
+        meta: !!(params.modifiers & 4),
+        ctrl: !!(params.modifiers & 2),
+        shift: !!(params.modifiers & 8),
+        alt: !!(params.modifiers & 1),
+      },
+    });
+  });
+
+  // Keyboard events via Input domain
+  cdp.on('Input.dispatchKeyEvent', (params) => {
+    if (params.type === 'keyDown') {
+      events.push({
+        type: 'keydown',
+        timestamp: Date.now(),
+        key: params.key || '',
+        code: params.code || '',
+        modifiers: {
+          meta: !!(params.modifiers & 4),
+          ctrl: !!(params.modifiers & 2),
+          shift: !!(params.modifiers & 8),
+          alt: !!(params.modifiers & 1),
+        },
+      });
+    }
+  });
+
+  // Network capture via Playwright's high-level API (simpler than raw CDP)
+  page.on('request', (request) => {
+    events.push({
+      type: 'network',
+      timestamp: Date.now(),
+      event: {
+        type: 'request',
+        requestId: request.url() + ':' + Date.now(), // Unique enough for recording
+        url: request.url(),
+        method: request.method(),
+        headers: sanitizeHeaders(request.headers()),
+        timestamp: Date.now(),
+      },
+    });
+  });
+
+  page.on('response', async (response) => {
+    try {
+      const body = await response.body(); // Async — may fail for redirects
+      const bodyHash = await blobStore.put(body);
+      events.push({
+        type: 'network',
+        timestamp: Date.now(),
+        event: {
+          type: 'response',
+          requestId: response.url() + ':' + Date.now(),
+          url: response.url(),
+          method: response.request().method(),
+          status: response.status(),
+          headers: sanitizeHeaders(response.headers()),
+          bodyHash,
+          durationMs: 0, // Timing not critical for recording
+        },
+      });
+    } catch {} // Some responses have no body (204, redirects)
+  });
+
+  return events; // Caller stops recording on user signal
+}
+```
+
+**Selector generation from CDP node** — Use `DOM.getNodeForLocation` to resolve click coordinates to a DOM element, then generate selectors in-page:
+
+```typescript
+async function generateSelectorFromNode(
+  page: Page, cdp: CDPSession, nodeId: number, node: Protocol.DOM.Node
+): Promise<SelectorBundle> {
+  // Resolve nodeId to a Playwright-usable object
+  const { object } = await cdp.send('DOM.resolveNode', { nodeId });
+  const remoteObjectId = object.objectId;
+
+  // Run selector generation in page context using the resolved element
+  const result = await page.evaluate(
+    ({ objectId }) => {
+      // __eyespy_resolvedElement is set by a helper that maps objectId → element
+      const el = (window as any).__eyespy_resolvedElement;
+      if (!el) return null;
+
+      const strategies: string[] = [];
+
+      // Strategy 1: data-testid (highest priority)
+      const testId = el.getAttribute('data-testid') || el.getAttribute('data-test-id');
+      if (testId) strategies.push(`[data-testid="${testId}"]`);
+
+      // Strategy 2: id (if not dynamically generated)
+      if (el.id && !/^[0-9]|[:.]|--/.test(el.id)) strategies.push(`#${el.id}`);
+
+      // Strategy 3: role + aria-label
+      const role = el.getAttribute('role') || el.tagName.toLowerCase();
+      const ariaLabel = el.getAttribute('aria-label');
+      if (ariaLabel) strategies.push(`${role}[aria-label="${ariaLabel}"]`);
+
+      // Strategy 4: structural CSS path (fallback)
+      // Walk up the tree building a unique path
+      function cssPath(element: Element): string {
+        const parts: string[] = [];
+        let current: Element | null = element;
+        while (current && current !== document.body) {
+          let selector = current.tagName.toLowerCase();
+          if (current.id && !/^[0-9]|[:.]|--/.test(current.id)) {
+            selector = `#${current.id}`;
+            parts.unshift(selector);
+            break;
+          }
+          const parent = current.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(c => c.tagName === current!.tagName);
+            if (siblings.length > 1) {
+              const idx = siblings.indexOf(current) + 1;
+              selector += `:nth-of-type(${idx})`;
+            }
+          }
+          parts.unshift(selector);
+          current = parent;
+        }
+        return parts.join(' > ');
+      }
+
+      const primary = strategies[0] || cssPath(el);
+      const fallbacks = strategies.slice(1);
+      if (!strategies.includes(cssPath(el))) fallbacks.push(cssPath(el));
+
+      return {
+        primary,
+        fallbacks,
+        fingerprint: {
+          text: el.innerText?.substring(0, 50),
+          rect: el.getBoundingClientRect().toJSON(),
+          tagName: el.tagName.toLowerCase(),
+        },
+      };
+    },
+    {} // Placeholder — actual element binding happens via CDP
+  );
+
+  return result || { primary: `body`, fallbacks: [], fingerprint: { tagName: 'body' } };
+}
+```
+
+**Note on element resolution**: CDP `DOM.getNodeForLocation` returns the topmost element at the given coordinates, accounting for z-index and stacking contexts. This is more reliable than page-side `document.elementFromPoint()` because it works even when the element is inside a Shadow DOM or behind an overlay. The actual element binding between CDP nodeId and page JavaScript uses `DOM.resolveNode` → `Runtime.callFunctionOn` with the resolved `RemoteObjectId`.
+
+**Input capture**: The CDP `Input` domain listeners are passive observers — they don't intercept or modify input. The user interacts normally with the page while we record. This is fundamentally different from the SDK approach (which monkey-patches APIs) — CDP recording is invisible to the page.
+
 ### Recording SDK: Key Data Structures
 
 **Session format** — Flat event array with monotonic timestamps. Network bodies stored separately in blobs.
@@ -675,6 +878,18 @@ interface Modifiers {
   shift: boolean;
   alt: boolean;
 }
+
+type NetworkEvent =
+  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; timestamp: number }
+  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash: string; durationMs: number; error?: string }
+  | { type: 'ws-open'; wsId: string; url: string; timestamp: number }
+  | { type: 'ws-send'; wsId: string; url: string; data: string; timestamp: number }
+  | { type: 'ws-receive'; wsId: string; url: string; data: string; timestamp: number }
+  | { type: 'ws-close'; wsId: string; url: string; code: number; timestamp: number }
+  | { type: 'sse-open'; sseId: string; url: string; timestamp: number }
+  | { type: 'sse-event'; sseId: string; url: string; eventType: string; data: string; lastEventId?: string; timestamp: number };
+// Note: Response bodies stored in blob store, referenced by bodyHash.
+// The bodyHash maps to a SHA-256 key in .eyespy/blobs/.
 ```
 
 ### Replay Engine: PRNG Seeding
@@ -803,11 +1018,15 @@ async function registerRoutes(context: BrowserContext, session: RecordedSession,
 
 **WebSocket mocking** — `page.routeWebSocket()` (Playwright 1.48+). Default behavior does NOT connect to real server — we control both sides.
 
+**Critical: Clock interaction** — Route handlers (including `routeWebSocket`) execute in **Node.js**, NOT the browser. Playwright's `clock.install()` only mocks browser-side timers. Using `setTimeout` in a handler uses real time, not mocked time — messages arrive at wrong times relative to the page's frozen clock.
+
+**Solution: Clock-coordinated delivery** — Don't use setTimeout in handlers. Instead, send WS messages immediately when triggered, and control timing from the replay orchestrator using `clock.runFor()`.
+
 ```typescript
 async function mockWebSockets(page: Page, session: RecordedSession) {
   const wsEvents = session.events.filter(e => e.type === 'network' && e.event.type?.startsWith('ws-'));
 
-  // Group by wsId
+  // Group by wsId, build timeline
   const wsTimelines = new Map<string, NetworkEvent[]>();
   for (const event of wsEvents) {
     const wsId = event.event.wsId;
@@ -815,39 +1034,38 @@ async function mockWebSockets(page: Page, session: RecordedSession) {
     wsTimelines.get(wsId)!.push(event.event);
   }
 
-  // Route each recorded WebSocket URL
   const wsUrls = new Set<string>();
   for (const event of wsEvents) {
     if (event.event.type === 'ws-open') wsUrls.add(event.event.url);
   }
 
+  // Store WS handles for clock-coordinated delivery from replay loop
+  const wsHandles = new Map<string, { ws: WebSocketRoute; pending: NetworkEvent[] }>();
+
   for (const url of wsUrls) {
     await page.routeWebSocket(new RegExp(escapeRegex(url)), (ws) => {
-      // ws.onMessage: messages FROM the page (client → server)
-      // ws.send: messages TO the page (server → client)
-
       const timeline = findWsTimeline(wsTimelines, url);
       if (!timeline) return;
 
-      // Replay server→client frames with recorded timing
-      let baseTime: number | null = null;
-      for (const event of timeline) {
-        if (event.type === 'ws-receive') {
-          if (baseTime === null) baseTime = event.timestamp;
-          const delay = event.timestamp - baseTime;
-          setTimeout(() => {
-            ws.send(event.data);
-          }, delay);
-        }
-      }
+      // Store handle — messages will be sent by the replay orchestrator
+      // at the right clock time, not via setTimeout
+      wsHandles.set(url, {
+        ws,
+        pending: timeline.filter(e => e.type === 'ws-receive'),
+      });
 
-      // Optionally log client→server messages for debugging
       ws.onMessage((message) => {
-        // Could verify against recorded ws-send events
+        // Log client→server for debugging / verification
       });
     });
   }
+
+  return wsHandles; // Replay loop uses these to send at clock-coordinated times
 }
+
+// In the replay orchestrator:
+// Between interactions, check if any WS messages should fire at this clock time
+// Call wsHandle.ws.send(data) then clock.runFor(delta) to advance
 ```
 
 **SSE mocking** — Replace `EventSource` via `addInitScript()` since `route.fulfill()` cannot stream.
@@ -868,7 +1086,9 @@ async function mockWebSockets(page: Page, session: RecordedSession) {
 
       const recorded = recordings.find(r => url.includes(r.url));
       if (!recorded) {
-        // Fallback to real EventSource if not recorded
+        // Fallback to real EventSource if not recorded.
+        // NOTE: Returning an object from a class constructor overrides `this` in JS.
+        // This works but is fragile — the returned object IS the instance.
         return new _OriginalEventSource(url, init);
       }
 
@@ -1013,7 +1233,7 @@ interface V8CoverageResult {
 ```typescript
 interface CoverageBitmap {
   sessionId: string;
-  version: { gitSha: string; bundleHash: string };
+  version: { gitSha: string; sourceContentHash: string }; // sourceContentHash = SHA-256 of V8 script sources
   totalBranches: number;
   coveredBranches: number;
   bitmap: Uint8Array;            // 1 bit per branch, packed
@@ -1053,7 +1273,7 @@ function v8ToBitmap(coverage: V8CoverageResult, appOrigin: string): CoverageBitm
 
   return {
     sessionId: '',
-    version: { gitSha: '', bundleHash: '' },
+    version: { gitSha: '', sourceContentHash: '' },
     totalBranches: branches.length,
     coveredBranches: branches.filter(b => b.covered).length,
     bitmap,
@@ -1413,7 +1633,7 @@ Matches pytest's 0/1/2 convention. GitHub Actions treats 1 and 2 identically as 
     <testcase name="hero-section" classname="homepage" time="1.23"/>
     <testcase name="navigation" classname="homepage" time="2.01">
       <failure message="Pixel diff 2.3% exceeds threshold" type="VisualDiff">
-Expected: baselines/homepage/navigation.png
+Baseline hash: sha256:a1f2b3c...
 Diff pixels: 1,847 (2.3%)
       </failure>
     </testcase>
@@ -1706,7 +1926,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 - **Determinism test**: 10-run identical screenshot assertion in Docker
 
 **Week 3: Recorder + Diff Engine (parallel tracks)**
-- *Playwright Recorder*: Wrap Playwright's event listeners to capture click/input/scroll/navigate events + network (fetch/XHR interception via CDP). Save as `RecordedSession` JSON. CSS selector generation with fingerprints.
+- *Playwright Recorder*: CDP-based recording using `CDPSession` — `Input.dispatchMouseEvent`/`Input.dispatchKeyEvent` listeners for raw user events, `DOM.getNodeForLocation(x,y)` to resolve click coordinates to DOM elements, then selector generation on the resolved node. Network via `page.on('request'/'response')` with async `response.body()` capture. Save as `RecordedSession` JSON. Use `addInitScript()` for selector fingerprint helpers (innerText, boundingRect, data-testid resolution).
 - *Diff engine*: pixelmatch + sharp integration, SHA-256 hash shortcircuit, dimension check (error if mismatch), HTML report with base64-inlined images (inline for <= 30 screenshots, folder-based for > 30).
 
 **Week 4: CLI Integration + CI**
@@ -1728,12 +1948,12 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 **Track 1: Coverage + Test Generation**
 - V8 coverage collection via `page.coverage.startJSCoverage({ resetOnNavigation: false })`
 - Bitmap extraction (V8 byte ranges → bit vector per branch)
-- Version stamping with `bundleContentHash` (not git SHA)
+- Version stamping with `sourceContentHash` (not git SHA)
 - Source map resolution: parse source maps to build `scriptUrl → localFilePath` mapping
 - Greedy set cover algorithm (BitSet-optimized)
 - Coverage-guided session skipping (TurboSnap equivalent, using source map resolution)
 - `eyespy generate` command
-- Staleness detection: invalidate only when `bundleContentHash` changes
+- Staleness detection: invalidate only when `sourceContentHash` changes
 
 **Track 2: Recording SDK + Advanced Mocking**
 - Browser SDK (fetch/XHR monkey-patch, event capture, selector generation, transport)
@@ -1800,7 +2020,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 | **SDK initialization race** | P0 | Must be first script. Runtime proxy verification. Periodic re-check. (Phase 1b — SDK not in Phase 1a) |
 | **No production kill switch** | P0 | allowedHosts + default 0% sampling. (Phase 1b — SDK not in Phase 1a) |
 | **Response body security** | P1 | Strip sensitive headers (Auth, Cookie, Set-Cookie). Keep bodies intact for replay. Document risk. `eyespy sanitize` command (Phase 1b) for sharing sessions. Production kill switch prevents accidental prod recording. |
-| **Coverage bitmap staleness** | P1 | Version-stamp with `bundleContentHash` (NOT git SHA). Only invalidate when bundle changes. If >50% stale and unreplayable, fall back to "replay all". |
+| **Coverage bitmap staleness** | P1 | Version-stamp with `sourceContentHash` (NOT git SHA). Only invalidate when bundle changes. If >50% stale and unreplayable, fall back to "replay all". |
 | **Storage explosion** | P1 | SHA-256 dedup (Phase 1b) + retention + session skipping. Flat file storage in Phase 1a is acceptable at MVP scale (< 20 sessions). |
 | **Screenshot dimension mismatch** | P1 | Explicit dimension check before diffing. Report as error, don't attempt resize. |
 | **Local vs CI baseline divergence** | P1 | Mandate Docker for CI baselines. Document that local runs may differ. Don't allow `eyespy approve` on non-Docker environments by default (override: `--force`). |
@@ -1810,6 +2030,11 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 | Shadow DOM invisible | P1 | Document limitation. Open shadow DOM partially supported. |
 | Streaming/chunked responses | P1 | Buffer to string for replay. `route.fulfill()` cannot stream. Document behavioral difference. |
 | Third-party scripts in coverage | P1 | Filter by URL prefix matching app origin (`script.url.startsWith(appOrigin)`). |
+| **FIFO queue depletion on smart retry** | P0 | `.shift()` consumes queue entries. Each retry needs fresh browser context + rebuilt queues from original session data. Validated by architecture: `replaySession()` is a pure function of (session, seed). |
+| **WS/SSE route handlers run in Node.js, not browser** | P0 | `routeWebSocket` handlers use real timers, not mocked clock. Solution: clock-coordinated delivery — send WS messages from replay orchestrator synchronized with `clock.runFor()`, not via setTimeout in handlers. |
+| **V8 source hash non-determinism across rebuilds** | P1 | Modern bundlers are NOT deterministic (chunk hashing, timestamps). Use `sourceContentHash` from `page.coverage.stopJSCoverage()` output — hash V8's actual executed scripts, not build artifacts. |
+| **CI cold start (missing blobs)** | P1 | `baselines.json` in git but blobs are local. Auto-detect missing blobs, warn, treat all screenshots as "new" (exit 0). Suggest `eyespy pull-baselines`. |
+| **CDP Input domain listener availability** | P1 | CDP `Input.dispatchMouseEvent` listener is how Playwright's codegen works internally. Well-supported. Fallback: page-level event listeners via `addInitScript()` (less reliable for Shadow DOM). |
 | Canvas/WebGL non-deterministic | Scoped out | Document limitation. Mask canvas regions in diffs. |
 | Cross-origin iframes invisible | Scoped out | Document limitation. Same-origin iframes supported. |
 | Service Workers bypass everything | Scoped out | Block SWs during replay (`serviceWorkers: 'block'`). |
@@ -1851,7 +2076,8 @@ Two PRNG variants are used for different contexts:
 
 **Phase 1a:**
 2. **Unit tests**: Selector generation, event serialization, network route matching, PRNG seeding, DOM settle detection, pixelmatch integration, HTML report generation
-3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery
+3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt)
+3b. **CDP recorder tests**: Record a 10-action sequence on TodoMVC via CDP, verify all events captured with correct selectors, verify network bodies stored in blob store, verify round-trip (record → save → load → replay produces matching screenshots)
 4. **E2E test**: Record session on TodoMVC → replay → diff → approve baselines → change CSS → replay → detect diff → approve new baselines
 5. **Determinism regression**: 10-run identical screenshot assertion runs in CI on every commit
 

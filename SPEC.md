@@ -160,12 +160,12 @@ Replays recorded sessions in headless Chromium with deterministic environment.
   - `document.timeline`: Override `currentTime` getter to return mocked `performance.now()`
   - `MessageChannel`: Wrap `postMessage` to route through mocked `setTimeout(fn, 0)` for deterministic delivery order
   - `performance.mark()` / `performance.measure()`: Stubbed by clock (return no-ops). Document that Performance Observer / Navigation Timing APIs return empty results.
-- **Playwright `animations: 'disabled'`**: Built-in option that handles CSS animations + CSS transitions + WAAPI. Protocol-level, not CSS injection. Finite animations fast-forwarded to completion. Infinite animations cancelled. No conflict with clock mocking (different layers).
+- **Playwright `animations: 'disabled'`**: Option on `page.screenshot()` (NOT browser/context level). Passed on every screenshot call: `page.screenshot({ animations: 'disabled' })`. Handles CSS animations + CSS transitions + WAAPI. Protocol-level, not CSS injection. Finite animations fast-forwarded to completion. Infinite animations cancelled. No conflict with clock mocking (different layers).
 - Additional anti-flake CSS: `caret-color: transparent; scroll-behavior: auto !important`
 - **Browser flags**: Try `--deterministic-mode` first (meta-flag intended to set `--run-all-compositor-stages-before-draw`, `--enable-begin-frame-control`, `--disable-threaded-animation`, `--disable-threaded-scrolling`, `--disable-checker-imaging`, `--disable-image-animation-resync`). **Fallback**: if `--deterministic-mode` is not recognized by the Chromium version bundled with Playwright (verify in Phase 0 PoC), set all 6 component flags individually. Additionally: `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
 - Fixed viewport: 1280x720, deviceScaleFactor: 1
 - **Fresh BrowserContext per session** (NOT a new browser process — reuse the same `Browser` instance for all sessions within a run, create a new `BrowserContext` for each): Each replay session starts with clean state — no localStorage, IndexedDB, cookies, or Service Workers from previous sessions. `browserContext` created with `storageState: undefined`, `serviceWorkers: 'block'`. Smart retry also creates fresh contexts (same browser).
-- **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`
+- **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`. Font loading works correctly with paused clock because: `@font-face` triggers network requests → fulfilled by route handlers (Node.js, real time) → browser font renderer processes data (rendering pipeline, not JS timers) → `document.fonts.ready` resolves. The clock mock only affects JS-level timer APIs, not network completion or rendering.
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
 **Network mocking**: **Targeted route patterns** — route only recorded origins (e.g., `page.route('**/api.stripe.com/**')`) instead of catch-all `**/*`. Catch-all introduces flakiness (#22338).
@@ -390,7 +390,9 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "navigationTimeoutMs": 30000,
     "concurrency": "auto",
     "smartRetry": true,
-    "mode": "mock"
+    "mode": "mock",
+    "viewport": { "width": 1280, "height": 720 },
+    "seed": "default"
   },
   "storage": {
     "backend": "local",
@@ -423,7 +425,7 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
 | Replay engine | **Playwright >= 1.48** | Clock API (with #31924 fix), routeWebSocket, animations:disabled |
 | CLI | **Commander.js** | Lightweight, standard |
 | Image diff | **pixelmatch + sharp** | Industry standard |
-| Coverage | **Playwright `page.coverage` API** (V8 Profiler) | Branch-level precision, simpler than raw CDP |
+| Coverage | **Playwright `page.coverage` API** (V8 Profiler) | Branch-level precision, Chromium-only (Firefox/WebKit don't support JS coverage) |
 | Monorepo | **pnpm workspaces + Turborepo** | Fast builds |
 | Lint/Format | **Biome** | Single tool |
 | Test runner | **Vitest** | Fast, Vite-native |
@@ -944,6 +946,36 @@ type NetworkEvent =
   | { type: 'sse-event'; sseId: string; url: string; eventType: string; data: string; lastEventId?: string; timestamp: number };
 // Note: Response bodies stored in blob store, referenced by bodyHash.
 // The bodyHash maps to a SHA-256 key in .eyespy/blobs/.
+
+// --- Replay types ---
+
+type ReplayResult =
+  | { status: 'success'; screenshots: Map<string, Buffer>; coverage?: CoverageBitmap; healingLog: HealingEvent[] }
+  | { status: 'replay-error'; reason: string; diagnosticScreenshot?: Buffer | null }
+  | { status: 'unreplayable'; reason: string; healingLog: HealingEvent[] };
+
+interface HealingEvent {
+  event: RecordedEvent;                // The interaction that needed healing
+  originalSelector: string;            // Primary selector that failed
+  healedSelector?: string;             // Fallback selector that worked (if any)
+  strategy?: string;                   // Which healing strategy matched ("testid", "role+label", etc.)
+  confidence?: number;                 // 0.0-1.0 confidence of the healed match
+  error?: string;                      // Error message if all strategies failed
+  skipped: boolean;                    // Whether the interaction was skipped entirely
+}
+
+/** Wraps baselines.json for ergonomic lookup */
+interface BaselineManifest {
+  version: number;
+  baselines: Record<string, Record<string, { hash: string; width: number; height: number }>>;
+  getHash(sessionId: string, screenshotKey: string): string | undefined;
+  setHash(sessionId: string, screenshotKey: string, hash: string, width: number, height: number): void;
+}
+
+/** Maps branch index → source location for session skipping */
+interface BranchIndex {
+  entries: Record<number, { scriptUrl: string; startOffset: number; endOffset: number }>;
+}
 ```
 
 **Session validation** (on load, before replay):
@@ -1039,6 +1071,16 @@ function normalizeUrl(rawUrl: string): string {
   return url.toString();
 }
 
+// Find the response event matching a request by requestId
+function findResponse(events: RecordedEvent[], requestId: string): NetworkEvent | undefined {
+  for (const event of events) {
+    if (event.type === 'network' && event.event.type === 'response' && event.event.requestId === requestId) {
+      return event.event;
+    }
+  }
+  return undefined;
+}
+
 // Build FIFO queues keyed by method + normalized URL
 function buildNetworkQueues(session: RecordedSession): Map<string, NetworkEvent[]> {
   const queues = new Map<string, NetworkEvent[]>(); // "METHOD:normalizedUrl" → FIFO queue
@@ -1054,16 +1096,17 @@ function buildNetworkQueues(session: RecordedSession): Map<string, NetworkEvent[
 }
 
 // Register routes per origin (NOT catch-all)
-async function registerRoutes(context: BrowserContext, session: RecordedSession, mode: 'mock' | 'live') {
+async function registerRoutes(
+  context: BrowserContext,
+  queues: Map<string, NetworkEvent[]>,  // Pre-built by buildNetworkQueues()
+  mode: 'mock' | 'live',
+) {
+  // Extract origins from queue keys ("METHOD:https://api.stripe.com/v1/charges" → "https://api.stripe.com")
   const origins = new Set<string>();
-  for (const event of session.events) {
-    if (event.type === 'network' && event.event.type === 'request') {
-      origins.add(new URL(event.event.url).origin);
-    }
+  for (const key of queues.keys()) {
+    const url = key.substring(key.indexOf(':') + 1); // Strip "METHOD:" prefix
+    origins.add(new URL(url).origin);
   }
-
-  // FIFO queues keyed by "METHOD:normalizedUrl" — same normalization used in lookup below
-  const queues = buildNetworkQueues(session);
 
   for (const origin of origins) {
     // Targeted pattern: only intercept this specific origin
@@ -1327,10 +1370,9 @@ async function replaySession(
 ): Promise<ReplayResult> {
   // 1. Fresh BrowserContext (clean state, no bleed between sessions/retries)
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
+    viewport: options.viewport ?? { width: 1280, height: 720 },
     deviceScaleFactor: 1,
     serviceWorkers: 'block',
-    // animations: 'disabled' is set here
   });
 
   // 2. Determinism setup — ORDER MATTERS
@@ -1434,12 +1476,15 @@ async function replaySession(
  * Absorbs remaining compositor/rendering timing variance.
  */
 async function captureStableScreenshot(page: Page, maxAttempts = 5, timeoutMs = 3000): Promise<Buffer> {
-  let previous = await page.screenshot({ type: 'png' });
+  // animations: 'disabled' is a screenshot option — fast-forwards CSS animations to completion,
+  // cancels infinite animations. Applied per-screenshot, not at browser/context level.
+  const opts = { type: 'png' as const, animations: 'disabled' as const };
+  let previous = await page.screenshot(opts);
   const deadline = Date.now() + timeoutMs;
 
   for (let i = 1; i < maxAttempts && Date.now() < deadline; i++) {
     await page.waitForTimeout(100); // Real time — not affected by clock mock
-    const current = await page.screenshot({ type: 'png' });
+    const current = await page.screenshot(opts);
     if (Buffer.compare(previous, current) === 0) return current; // Stable
     previous = current;
   }
@@ -1485,6 +1530,75 @@ async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog:
 }
 
 /**
+ * Auto-healing selector resolution. Try primary, then fallback cascade.
+ * Phase 1a: strategies 1-5. Phase 1b: full 9-strategy cascade.
+ */
+async function resolveSelector(page: Page, bundle: SelectorBundle, healingLog: HealingEvent[]): Promise<Locator> {
+  // Strategy 1: Primary selector with short timeout
+  try {
+    const locator = page.locator(bundle.primary);
+    await locator.waitFor({ state: 'visible', timeout: 1500 });
+    return locator;
+  } catch {}
+
+  // Strategies 2-5: Fallback selectors stored in SelectorBundle
+  for (const fallback of bundle.fallbacks) {
+    try {
+      const locator = page.locator(fallback);
+      await locator.waitFor({ state: 'visible', timeout: 500 });
+      healingLog.push({
+        event: {} as RecordedEvent, // Caller fills this
+        originalSelector: bundle.primary,
+        healedSelector: fallback,
+        strategy: classifyStrategy(fallback),
+        confidence: strategyConfidence(fallback),
+        skipped: false,
+      });
+      return locator;
+    } catch {}
+  }
+
+  // Strategy 5: Text content + tag name (not stored in fallbacks — dynamic)
+  if (bundle.fingerprint.text && bundle.fingerprint.tagName) {
+    const textLocator = page.locator(
+      `${bundle.fingerprint.tagName}:has-text("${bundle.fingerprint.text.substring(0, 30)}")`
+    );
+    try {
+      await textLocator.waitFor({ state: 'visible', timeout: 500 });
+      if (await textLocator.count() === 1) { // Strict single match
+        healingLog.push({
+          event: {} as RecordedEvent,
+          originalSelector: bundle.primary,
+          healedSelector: `text+tag: ${bundle.fingerprint.tagName}/${bundle.fingerprint.text.substring(0, 20)}`,
+          strategy: 'text+tag',
+          confidence: 0.75,
+          skipped: false,
+        });
+        return textLocator;
+      }
+    } catch {}
+  }
+
+  // All strategies failed
+  throw new Error(`Selector resolution failed for: ${bundle.primary}`);
+}
+
+function classifyStrategy(selector: string): string {
+  if (selector.startsWith('[data-testid')) return 'testid';
+  if (selector.includes('[role=') && selector.includes('[aria-label=')) return 'role+label';
+  if (selector.includes('[role=')) return 'role+text';
+  if (selector.startsWith('#')) return 'id';
+  return 'css-path';
+}
+
+function strategyConfidence(selector: string): number {
+  if (selector.startsWith('[data-testid')) return 0.95;
+  if (selector.includes('[role=') && selector.includes('[aria-label=')) return 0.90;
+  if (selector.includes('[role=')) return 0.85;
+  return 0.70;
+}
+
+/**
  * Deliver WS/SSE messages that should arrive between lastTime and currentTime.
  * Messages are delivered immediately (not via setTimeout) — clock timing is
  * controlled by the orchestrator's clock.runFor() calls.
@@ -1513,7 +1627,33 @@ async function deliverPendingMessages(
 }
 
 function pad(n: number): string { return String(n).padStart(3, '0'); }
+
+// Utility: escape string for use in RegExp constructor
+function escapeRegex(str: string): string { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Utility: map numeric button to Playwright button name
+function buttonName(button: number): 'left' | 'right' | 'middle' {
+  return button === 2 ? 'right' : button === 1 ? 'middle' : 'left';
+}
+
+// Utility: map our Modifiers type to Playwright's modifier keys
+function toModifiers(m: Modifiers): Array<'Alt' | 'Control' | 'Meta' | 'Shift'> {
+  const result: Array<'Alt' | 'Control' | 'Meta' | 'Shift'> = [];
+  if (m.alt) result.push('Alt');
+  if (m.ctrl) result.push('Control');
+  if (m.meta) result.push('Meta');
+  if (m.shift) result.push('Shift');
+  return result;
+}
 ```
+
+**Diffing in-memory screenshots against baselines**: The orchestrator has `Map<string, Buffer>` (screenshots) but baselines are SHA-256 hashes in `baselines.json` pointing to blobs on disk. The bridge:
+1. For each screenshot Buffer, compute its SHA-256 hash
+2. Look up the baseline hash from `baselines.getHash(sessionId, key)`
+3. If hashes match → identical, skip pixelmatch
+4. If hashes differ → write both Buffers to temp files, run `compareScreenshots()`, store diff image
+5. Clean up temp files after comparison
+This avoids writing all screenshots to disk — only differing ones touch the filesystem.
 
 **Smart retry orchestration** (wraps `replaySession`):
 ```typescript
@@ -1708,6 +1848,13 @@ function greedySetCover(
   }
 
   return { selected, coverageRatio: coveredCount / totalReachable };
+}
+
+// popcount for Uint8Array (sum of all set bits)
+function popcount(bytes: Uint8Array): number {
+  let total = 0;
+  for (let i = 0; i < bytes.length; i++) total += popcount8(bytes[i]);
+  return total;
 }
 
 // popcount for single byte
@@ -2234,7 +2381,7 @@ Use `biome ci .` in CI (read-only, proper exit codes), `biome check --apply .` i
 
 Combined with `--disable-gpu` and `--force-color-profile=srgb` from the spec. Text appears "softer" with all flags — acceptable for regression testing.
 
-**`animations: 'disabled'`** — Protocol-level, NOT CSS injection. Finite animations fast-forwarded to completion state. Infinite animations cancelled and reset. Elements end up in their "after" state, not "before".
+**`animations: 'disabled'`** — Per-screenshot option, protocol-level (NOT CSS injection). Finite animations fast-forwarded to completion state. Infinite animations cancelled and reset. Elements end up in their "after" state, not "before". Must be passed on every `page.screenshot()` call.
 
 **Screenshot stability mechanism** (`toHaveScreenshot()` internals — we borrow this for our settle detection):
 
@@ -2252,7 +2399,7 @@ A page with a ticking clock never stabilizes. Our PRNG seeding + scoped clock ha
 - Uses CDP `Page.addScriptToEvaluateOnNewDocument` internally
 - **Survives navigations** — re-evaluated on every page load, including link clicks and form submissions
 - `browserContext.addInitScript()` applies to ALL pages including popups; `page.addInitScript()` applies to one page only
-- Order between multiple context-level and page-level scripts is NOT guaranteed — don't depend on it
+- **Ordering**: Scripts at the SAME level (e.g., multiple `context.addInitScript()` calls) execute in registration order. Interleaving between context-level and page-level scripts is NOT guaranteed. Since Eyespy uses only `context.addInitScript()`, our PRNG → clock patches → SSE mock ordering is preserved.
 - Runs in page JS context (not Node.js), cannot use `require()`
 
 **CDP coverage + route interception coexistence**: No documented conflicts. They operate at different layers:
@@ -2444,6 +2591,7 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 | **V8 source hash non-determinism across rebuilds** | P1 | Modern bundlers are NOT deterministic (chunk hashing, timestamps). Use `sourceContentHash` from `page.coverage.stopJSCoverage()` output — hash V8's actual executed scripts, not build artifacts. |
 | **CI cold start (missing blobs)** | P1 | `baselines.json` in git but blobs are local. Auto-detect missing blobs, warn, treat all screenshots as "new" (exit 0). Suggest `eyespy pull-baselines`. |
 | **Page-level event listener interference** | P1 | Recorder uses capture-phase `addEventListener` on `document`. Apps that call `stopImmediatePropagation()` on capture phase can block event recording. Mitigation: inject listeners as the very first script via `addInitScript()` — our listeners register before any app code. If still missed, log a warning about uncaptured interactions. |
+| **Web Workers bypass PRNG seeding** | Scoped out | `addInitScript()` only runs in main page context. Workers that call `crypto.getRandomValues()` or `Math.random()` get real random values. Most SPAs don't use Workers for UUID generation. Document limitation. Phase 1b: investigate `worker.evaluate()` for dedicated workers. Shared/Service Workers are already blocked. |
 | Canvas/WebGL non-deterministic | Scoped out | Document limitation. Mask canvas regions in diffs. |
 | Cross-origin iframes invisible | Scoped out | Document limitation. Same-origin iframes supported. |
 | Service Workers bypass everything | Scoped out | Block SWs during replay (`serviceWorkers: 'block'`). |
@@ -2457,7 +2605,7 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 3. **SDK receiver port**: `eyespy record --listen` spins up a temp HTTP server. Default port 8479, configurable via `--port`.
 4. **CI concurrency sharding**: At > 100 sessions, need to shard across multiple CI jobs. Design the sharding mechanism (session ID ranges? round-robin?) before Phase 1b ships.
 5. **Phase 2 PostgreSQL schema**: Design the server-side schema during Phase 1b even if not implemented until Phase 2. Retrofitting a schema onto an existing CLI data model causes impedance mismatch.
-6. **Replay target URL differs from recording URL**: Sessions record against `http://localhost:3000` but CI may use a different host/port (Docker networking, preview deployments). Need URL rewriting: `eyespy replay --url http://ci-container:3000` should remap recorded navigation URLs and network origins. Phase 1a: simple host:port replacement. Phase 1b: configurable URL mapping.
+6. **Replay target URL differs from recording URL**: Sessions record against `http://localhost:3000` but CI may use a different host/port (Docker networking, preview deployments). **Phase 1a solution**: `eyespy replay --url http://ci-container:3000` extracts the origin from the recorded session (`session.url`) and from the `--url` flag, then applies origin substitution to: (a) the initial `page.goto()` URL, (b) all `navigate` event URLs, (c) FIFO queue keys (remap recorded origin to replay origin). Network mocking routes remain targeted by recorded *third-party* origins (Stripe, S3, etc.) which don't change. Only the *app origin* is remapped. **Phase 1b**: configurable multi-origin URL mapping in config for complex setups (e.g., API gateway on different host than frontend).
 7. **Concurrent recording + replay**: Can a user record new sessions while replaying old ones? Currently no resource conflict (different browser instances), but both write to `.eyespy/blobs/` — blob store's atomic write (write → rename) handles this safely. Document as supported.
 
 ## PRNG Design Note

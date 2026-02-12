@@ -1,4 +1,4 @@
-# Tripwire: Open-Source Visual Regression Testing Platform
+# Eyespy: Open-Source Visual Regression Testing Platform
 
 ## Context
 
@@ -12,7 +12,7 @@ No open-source alternative provides the full pipeline. Lost Pixel, Argos CI, and
 
 ## Decisions (All Rounds)
 
-- **Name**: Tripwire (`@tripwire/*` scope on npm)
+- **Name**: Eyespy (`@eyespy/*` scope on npm)
 - Full Meticulous parity (recording, replay, auto-test-generation, test pruning)
 - "Good enough" determinism (Playwright anti-flake stack + pixel tolerance, NOT a Chromium fork)
 - Record/replay focused (no AI exploration agent)
@@ -21,15 +21,16 @@ No open-source alternative provides the full pipeline. Lost Pixel, Argos CI, and
 - **CLI-first for V1** — no server/DB/dashboard. Server + dashboard + GitHub integration in Phase 2.
 - TypeScript + Playwright stack
 - Both script tag recording AND Playwright recorder — **same session format, different capture methods**
-- SDK posts to configurable endpoint; **always-on receiver** (`tripwire record --listen`) during recording
-- Git-tracked baselines, local data directory for sessions/artifacts
+- SDK posts to configurable endpoint; **always-on receiver** (`eyespy record --listen`) during recording
+- **Baselines**: Manifest-only in git (`baselines.json` with SHA-256 hashes). Actual PNGs in local content-addressable blob store (gitignored). Optional remote sync (S3/R2) for team sharing.
+- **Screenshots**: Tiered capture — always after navigations + end-of-session, with stabilization after significant interactions (clicks/submits), skip keystrokes/hovers/scrolls. Two-consecutive-identical-screenshots stabilization loop.
 - Smart retry: 1x replay, re-confirm only diffs (not always-3x) — **default ON**
 - Full dedup + retention for storage from V1
 - **Phased delivery**: Phase 0 (PoC) → Phase 1a (MVP) → Phase 1b (completion) → Phase 2 (server)
 - WS + SSE support in **Phase 1b** (not 1a MVP)
 - Single-team for V1 (no multi-tenancy)
 - GitHub OAuth + RBAC when server ships (Phase 2)
-- **Clock**: Full `clock.install()` on Playwright >= 1.47 (#31924 fix landed). Date + setTimeout + setInterval all mocked.
+- **Clock**: Full `clock.install()` on Playwright >= 1.48. Date + setTimeout + setInterval all mocked. Custom `addInitScript` patches for `document.timeline.currentTime` and `MessageChannel` timing.
 - **Network**: Block all unrecorded origins in mock mode (fully isolated replay)
 - **Auto-healing replay**: Basic fallback cascade in 1a, advanced healing overlay + confidence scoring in 1b
 - **Response bodies**: No size limit, store in blobs. Strip sensitive headers only (Auth, Cookie, Set-Cookie). Document security implications. No body redaction (breaks replay).
@@ -49,12 +50,12 @@ Phase 1: CLI Tool (no server)
      │   Records clicks + network         (or local file via CLI receiver)
      │
      └── OR: Playwright-based recording via CLI
-              npx tripwire record --url http://localhost:3000
+              npx eyespy record --url http://localhost:3000
 
-  Recorded Sessions (.tripwire/sessions/*.json)
+  Recorded Sessions (.eyespy/sessions/*.json)
      │
      ▼
-  npx tripwire replay --url http://localhost:3000
+  npx eyespy replay --url http://localhost:3000
      │
      ├── Playwright + anti-flake stack
      ├── Network mocking from recorded data
@@ -63,22 +64,23 @@ Phase 1: CLI Tool (no server)
      └── Smart retry (re-confirm diffs only)
      │
      ▼
-  npx tripwire diff
+  npx eyespy diff
      │
      ├── pixelmatch with tolerance
      ├── Content-addressable dedup (SHA-256)
      └── Three-panel HTML report
      │
      ▼
-  npx tripwire generate
+  npx eyespy generate
      │
      ├── Greedy set cover on coverage bitmaps
      ├── Dedup identical coverage sessions
      └── Outputs minimal test suite config
 
-  Baselines: .tripwire/baselines/ (git-tracked)
-  Sessions:  .tripwire/sessions/  (gitignored, local)
-  Artifacts: .tripwire/runs/      (gitignored, local)
+  Baselines: .eyespy/baselines.json (git-tracked manifest, SHA-256 hashes)
+  Blobs:     .eyespy/blobs/        (gitignored, content-addressable PNGs + bodies)
+  Sessions:  .eyespy/sessions/     (gitignored, recorded session data)
+  Artifacts: .eyespy/runs/         (gitignored, replay run outputs)
 ```
 
 ```
@@ -129,7 +131,7 @@ Lightweight JS injected via script tag. Records clickstream + network, NOT DOM m
 
 **Selector strategy**: `data-testid` > `id` > `role+aria-label` > structural CSS path. Store heuristic fingerprints (innerText snippet + boundingRect) alongside selector. Validate with `querySelector`. Skip virtualized list items (detect `data-index` or `style="transform:..."` patterns).
 
-**Transport**: Regular `fetch` during session (with retry + exponential backoff). Reserve `sendBeacon` for `pagehide` event only (last-chance flush). Batch 50 events OR 5s. Max buffer 5MB — circuit breaker after N consecutive failures.
+**Transport**: Uses `_originalFetch` (the saved pre-patch reference) for its own HTTP calls — MUST NOT use `window.fetch` which would be intercepted by the SDK's own monkey-patch, causing infinite recursion. Retry + exponential backoff. Reserve `sendBeacon` for `pagehide` event only (last-chance flush). Batch 50 events OR 5s. Max buffer 5MB — circuit breaker after N consecutive failures.
 
 **Compression**: CompressionStream API (zero-cost) with fflate fallback for Safari < 16.4.
 
@@ -152,11 +154,16 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 
 **Determinism stack**:
 - **Seeded PRNG injection** (table-stakes): `addInitScript()` that replaces `Math.random`, `crypto.randomUUID`, and `crypto.getRandomValues` with seeded deterministic versions. Without this, nothing works — every SPA generates client-side UUIDs.
-- **Full Clock API** (`page.clock.install()`): Requires Playwright >= 1.47 where the `Event.prototype.timeStamp` fix (#31924) landed. Mocks `Date`, `setTimeout`, `setInterval`, `requestAnimationFrame`, `performance.now`. Use `clock.pauseAt()` to freeze time for screenshots, `clock.runFor()` to advance timers deterministically between interactions, `clock.resume()` as escape hatch for edge cases. This gives full timer determinism — `setTimeout(() => X, 1000)` fires instantly when we advance the clock.
-- **Playwright `animations: 'disabled'`**: Built-in option that handles CSS animations + CSS transitions + WAAPI. Replaces raw CSS injection for animation control.
+- **Full Clock API** (`page.clock.install()`): Requires Playwright >= 1.48. Mocks `Date`, `setTimeout`, `setInterval`, `requestAnimationFrame`, `performance.now`, `requestIdleCallback`, `Intl.DateTimeFormat` (default date). Use `clock.pauseAt()` to freeze time for screenshots, `clock.runFor()` to advance timers deterministically between interactions, `clock.resume()` as escape hatch for edge cases. This gives full timer determinism — `setTimeout(() => X, 1000)` fires instantly when we advance the clock.
+- **Clock gap patches** (via `addInitScript`): Playwright's clock does NOT mock `document.timeline.currentTime` (breaks Framer Motion, open issue #38951) or `MessageChannel` timing (used by React 18+ scheduler). We patch both:
+  - `document.timeline`: Override `currentTime` getter to return mocked `performance.now()`
+  - `MessageChannel`: Wrap `postMessage` to route through mocked `setTimeout(fn, 0)` for deterministic delivery order
+  - `performance.mark()` / `performance.measure()`: Stubbed by clock (return no-ops). Document that Performance Observer / Navigation Timing APIs return empty results.
+- **Playwright `animations: 'disabled'`**: Built-in option that handles CSS animations + CSS transitions + WAAPI. Protocol-level, not CSS injection. Finite animations fast-forwarded to completion. Infinite animations cancelled. No conflict with clock mocking (different layers).
 - Additional anti-flake CSS: `caret-color: transparent; scroll-behavior: auto !important`
-- Browser flags: `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`
+- **Browser flags**: `--deterministic-mode` (meta-flag that sets `--run-all-compositor-stages-before-draw`, `--enable-begin-frame-control`, `--disable-threaded-animation`, `--disable-threaded-scrolling`, `--disable-checker-imaging`, `--disable-image-animation-resync`) plus `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
 - Fixed viewport: 1280x720, deviceScaleFactor: 1
+- **Fresh browser context per session**: Each replay session starts with clean state — no localStorage, IndexedDB, cookies, or Service Workers from previous sessions. `browserContext` created with `storageState: undefined`, `serviceWorkers: 'block'`.
 - **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
@@ -197,11 +204,19 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - Skip remaining interactions in this session, continue to next session
 - Do NOT attempt to screenshot or diff a half-loaded page
 
-**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times for those specific screenshots. Majority vote (2-of-3). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON.**
+**Screenshot timing** (tiered strategy):
+- **Always capture**: After navigations (URL changes, route transitions), after end of session (final state)
+- **Capture with stabilization**: After clicks/submits that trigger visible state changes (detected via MutationObserver firing within 500ms of the event)
+- **Skip**: Individual keystrokes mid-input (wait for blur/submit), mouse moves, hovers, scroll events (unless they trigger lazy loading)
+- **Stabilization loop** (Playwright/Chromatic pattern): After dispatching event and waiting for DOM settle, take screenshot A. Wait 100ms. Take screenshot B. If A === B (pixel-identical), use B. If different, repeat (max 5 attempts or 3s timeout). This absorbs remaining compositor/rendering timing variance.
+- **Clock lifecycle per screenshot**: `clock.pauseAt()` before capture (freeze all timers), take stabilized screenshot, `clock.resume()` before next interaction.
+- Configurable via `screenshotStrategy` in config: `"tiered"` (default), `"every"` (every event), `"manual"` (only explicit `screenshot-marker` events)
 
-**Coverage collection**: CDP `Profiler.startPreciseCoverage({ detailed: true })`. Extract branch-level bitmap. Version-stamp with `bundleContentHash` (NOT git SHA — git SHA changes every commit but the bundle may be identical). Only invalidate bitmaps when the bundle content actually changes.
+**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times for those specific screenshots. Majority vote (2-of-3). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.**
 
-**DOM settle detection**: MutationObserver + requestAnimationFrame drain. Wait for 300ms of no DOM changes (increased from 200ms to accommodate Material UI's 400ms transitions after animation disabling). Also wait for `img.complete` on visible images.
+**Coverage collection**: `page.coverage.startJSCoverage({ resetOnNavigation: false })`. Extract branch-level bitmap. Version-stamp with `bundleContentHash` (NOT git SHA — git SHA changes every commit but the bundle may be identical). Only invalidate bitmaps when the bundle content actually changes. `resetOnNavigation: false` accumulates coverage across SPA navigations within a session.
+
+**DOM settle detection**: MutationObserver + requestAnimationFrame drain. Wait for 300ms of no DOM changes. Also wait for `document.fonts.ready`, `img.complete` on visible images, and rAF drain (two frames). **Clock interaction**: The settle detection runs inside `page.evaluate()` where `Date.now()` is mocked. Use `page.waitForTimeout()` (real time) as the outer timeout wrapper to prevent hangs when clock is paused.
 
 **Resource constraints**: Chrome uses 3-20GB RAM per instance. Default concurrency: `Math.min(2, Math.floor(os.totalmem() / 5GB))`. Hard timeout: 120s per session replay, 30s per navigation.
 
@@ -222,8 +237,8 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - Coverage-guided session skipping (TurboSnap equivalent): only replay sessions whose bitmaps overlap with files changed in the current diff. 80%+ time savings.
 
 **File storage** (CLI-first):
-- `.tripwire/coverage/` — bitmap files per session, keyed by session ID
-- `.tripwire/suites/` — generated suite config (list of session IDs + coverage stats)
+- `.eyespy/coverage/` — bitmap files per session, keyed by session ID
+- `.eyespy/suites/` — generated suite config (list of session IDs + coverage stats)
 
 ### 4. Visual Diff Engine
 
@@ -235,59 +250,60 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - Three-panel output: expected | actual | diff (red pixels)
 - **HTML report**: Standalone HTML file with base64-inlined images for <= 30 screenshots. **Folder-based report** (images as separate files + index.html) for > 30 screenshots. Four viewer modes: side-by-side, slider (CSS `clip-path`), blend (opacity crossfade), toggle (click to switch).
 
-### 5. CLI (`@tripwire/cli`)
+### 5. CLI (`@eyespy/cli`)
 
 ```bash
 # Setup
-tripwire init                                       # Create .tripwire/ dir, config.json, update .gitignore
+eyespy init                                       # Create .eyespy/ dir, config.json, update .gitignore
 
 # Recording
-tripwire record --url http://localhost:3000        # Playwright-based recording
-tripwire record --listen 8479                      # Start receiver for SDK recordings (Phase 1b)
+eyespy record --url http://localhost:3000        # Playwright-based recording
+eyespy record --listen 8479                      # Start receiver for SDK recordings (Phase 1b)
 
 # Replay + Diff
-tripwire replay --url http://localhost:3000        # Replay all sessions, capture screenshots
-tripwire diff                                       # Compare against baselines
-tripwire approve                                    # Accept current screenshots as new baselines
-tripwire approve --session <id>                     # Approve specific session
+eyespy replay --url http://localhost:3000        # Replay all sessions, capture screenshots
+eyespy diff                                       # Compare against baselines
+eyespy approve                                    # Accept current screenshots as new baselines
+eyespy approve --session <id>                     # Approve specific session
 
 # Test Generation (Phase 1b)
-tripwire generate                                   # Auto-generate minimal test suite from sessions
-tripwire generate --target-coverage 80              # Target 80% branch coverage
+eyespy generate                                   # Auto-generate minimal test suite from sessions
+eyespy generate --target-coverage 80              # Target 80% branch coverage
 
 # CI (all-in-one)
-tripwire ci --url http://localhost:3000             # Replay + diff + exit code
-tripwire ci --url http://localhost:3000 --confirm   # Smart retry for diffs
+eyespy ci --url http://localhost:3000             # Replay + diff + exit code
+eyespy ci --url http://localhost:3000 --confirm   # Smart retry for diffs
+
+# Baselines
+eyespy push-baselines                             # Upload baseline blobs to remote storage
+eyespy pull-baselines                             # Download baseline blobs from remote storage
 
 # Utilities
-tripwire status                                     # Suite health, coverage stats, staleness
-tripwire prune                                      # Remove stale sessions and expired artifacts
-tripwire prune --older-than 30d                     # Custom retention
-tripwire sanitize                                   # Strip response bodies for sharing sessions (Phase 1b)
+eyespy status                                     # Suite health, coverage stats, staleness
+eyespy prune                                      # Remove stale sessions and expired artifacts
+eyespy prune --older-than 30d                     # Custom retention
+eyespy sanitize                                   # Strip response bodies for sharing sessions (Phase 1b)
 ```
 
-**`tripwire init`**: Creates `.tripwire/` directory with default `config.json`, adds `.tripwire/sessions/`, `.tripwire/blobs/`, `.tripwire/runs/`, `.tripwire/coverage/` to `.gitignore`. Auto-runs on first `tripwire record` if not initialized.
+**`eyespy init`**: Creates `.eyespy/` directory with default `config.json` and empty `baselines.json` (both git-tracked). Adds `.eyespy/sessions/`, `.eyespy/blobs/`, `.eyespy/runs/`, `.eyespy/coverage/` to `.gitignore`. Auto-runs on first `eyespy record` if not initialized.
 
 JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 0 = all pass, 1 = diffs detected, 2 = replay failures.
 
-### 6. Storage (Content-Addressable)
+### 6. Storage (Manifest + Content-Addressable Blobs)
 
 ```
-.tripwire/
-├── config.json                    # Project config (target URL, diff tolerance, etc.)
-├── baselines/                     # Git-tracked
-│   └── <session-id>/
-│       ├── 001-page-load.png
-│       ├── 002-click-submit.png
-│       └── ...
+.eyespy/
+├── config.json                    # Project config — git-tracked
+├── baselines.json                 # Baseline manifest — git-tracked (small JSON, ~5KB)
+│                                  # Maps session-id/screenshot-name → SHA-256 hash
+├── suites/                        # Git-tracked — generated test suite configs
+│   └── default.json
 ├── sessions/                      # Gitignored — recorded session data
 │   └── <session-id>.json          # Interactions + network (bodies stored separately)
 ├── blobs/                         # Gitignored — content-addressable store
-│   └── <sha256-prefix>/<sha256>   # Network bodies, screenshots, diffs
+│   └── <sha256-prefix>/<sha256>   # Baseline PNGs, network bodies, screenshots, diffs
 ├── coverage/                      # Gitignored — coverage bitmaps
 │   └── <session-id>.bitmap
-├── suites/                        # Git-tracked — generated test suite configs
-│   └── default.json
 └── runs/                          # Gitignored — replay run artifacts
     └── <run-id>/
         ├── screenshots/           # References into blobs/
@@ -295,9 +311,71 @@ JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 
         └── report.html
 ```
 
-**Dedup**: All binary artifacts (screenshots, network bodies, diff images) stored by SHA-256 hash. Same screenshot across runs stored once. **Expected savings: 60-80%.**
+**Key design**: Only `config.json`, `baselines.json`, and `suites/` are git-tracked. All binary artifacts (PNGs, network bodies) live in `blobs/` (gitignored). This prevents git repo bloat — the manifest file changes by a few bytes per approval, not megabytes of PNGs.
 
-**Retention**: `tripwire prune` command. Default: sessions older than 30 days, run artifacts older than 7 days. Baselines kept indefinitely (git-tracked).
+**Baseline manifest format**:
+```json
+{
+  "version": 1,
+  "baselines": {
+    "session-abc123": {
+      "001-page-load": { "hash": "sha256:e3b0c44...", "width": 1280, "height": 720 },
+      "002-click-submit": { "hash": "sha256:a1f2b3c...", "width": 1280, "height": 720 }
+    }
+  }
+}
+```
+
+**Team sharing**: By default, blobs are local. For teams, configure a remote storage backend:
+```bash
+eyespy push-baselines              # Upload baseline blobs to remote
+eyespy pull-baselines              # Download baseline blobs from remote
+```
+Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash), has(hash) }`. Built-in: local filesystem (default), S3-compatible (AWS S3, Cloudflare R2, MinIO, Backblaze B2). Designed following reg-suit's plugin architecture.
+
+**Dedup**: All binary artifacts stored by SHA-256 hash. Same screenshot across runs stored once. **Expected savings: 60-80%.**
+
+**Retention**: `eyespy prune` command. Default: sessions older than 30 days, run artifacts older than 7 days. Baselines kept as long as referenced in `baselines.json`.
+
+### 7. Config Schema
+
+```json
+{
+  "targetUrl": "http://localhost:3000",
+  "diff": {
+    "threshold": 0.1,
+    "maxDiffPixelRatio": 0.005,
+    "includeAA": false
+  },
+  "replay": {
+    "screenshotStrategy": "tiered",
+    "quiescenceMs": 300,
+    "sessionTimeoutMs": 120000,
+    "navigationTimeoutMs": 30000,
+    "concurrency": "auto",
+    "smartRetry": true,
+    "mode": "mock"
+  },
+  "storage": {
+    "backend": "local",
+    "remote": {
+      "type": "s3",
+      "bucket": "",
+      "region": "",
+      "prefix": "eyespy-baselines/"
+    }
+  },
+  "recording": {
+    "receiverPort": 8479,
+    "excludePaths": [],
+    "sensitiveHeaders": ["Authorization", "Cookie", "Set-Cookie"]
+  },
+  "report": {
+    "format": "html",
+    "inlineThreshold": 30
+  }
+}
+```
 
 ---
 
@@ -309,7 +387,7 @@ JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 
 | Replay engine | **Playwright >= 1.48** | Clock API (with #31924 fix), routeWebSocket, animations:disabled |
 | CLI | **Commander.js** | Lightweight, standard |
 | Image diff | **pixelmatch + sharp** | Industry standard |
-| Coverage | **V8 Profiler via CDP** | Branch-level precision |
+| Coverage | **Playwright `page.coverage` API** (V8 Profiler) | Branch-level precision, simpler than raw CDP |
 | Monorepo | **pnpm workspaces + Turborepo** | Fast builds |
 | Lint/Format | **Biome** | Single tool |
 | Test runner | **Vitest** | Fast, Vite-native |
@@ -322,7 +400,7 @@ Phase 2 additions: Fastify, Drizzle, PostgreSQL 16, BullMQ, Redis, React 19, Vit
 ## Package Structure
 
 ```
-tripwire/
+eyespy/
 ├── packages/
 │   ├── recorder-sdk/         # Browser recording SDK (< 18KB gzipped)
 │   │   └── src/
@@ -352,7 +430,7 @@ tripwire/
 │   │       └── session-skipper.ts  # TurboSnap equivalent
 │   │
 │   ├── cli/                   # Commander.js CLI
-│   │   └── src/commands/      # record, replay, diff, generate, approve, ci, status, prune
+│   │   └── src/commands/      # record, replay, diff, generate, approve, ci, status, prune, push/pull-baselines
 │   │
 │   └── shared/                # Types + utilities
 │       └── src/
@@ -424,12 +502,12 @@ window.fetch = function(input: RequestInfo | URL, init?: RequestInit): Promise<R
 
 ```typescript
 XMLHttpRequest.prototype.open = function(method: string, url: string, ...args: any[]) {
-  this.__tripwire = { method, url, requestId: nextRequestId(), startTime: performance.now() };
+  this.__eyespy = { method, url, requestId: nextRequestId(), startTime: performance.now() };
   return _originalXHROpen.apply(this, [method, url, ...args]);
 };
 
 XMLHttpRequest.prototype.send = function(body?: any) {
-  const meta = this.__tripwire;
+  const meta = this.__eyespy;
   if (meta) {
     recordNetworkEvent({ type: 'request', ...meta, body: truncate(body, MAX_BODY_SIZE) });
     this.addEventListener('loadend', () => {
@@ -544,12 +622,14 @@ function verifyInterception(): { fetch: boolean; xhr: boolean; ws: boolean } {
 
 ```typescript
 interface RecordedSession {
+  formatVersion: 1;              // Schema version — reject with clear error if mismatch
   id: string;                    // UUID v4
   startedAt: string;             // ISO 8601
   endedAt: string;
   url: string;                   // Starting URL
   viewport: { width: number; height: number };
   userAgent: string;
+  captureMethod: 'playwright' | 'sdk';  // Which recorder produced this session
   events: RecordedEvent[];       // Chronological, monotonic timestamps
   networkBodies: Record<string, string>; // requestId → blob hash (large bodies stored separately)
 }
@@ -670,20 +750,18 @@ The most critical piece of the determinism stack. Must run before ANY page JavaS
 **HTTP routes** — Use `browserContext.route()` (survives navigations) with targeted per-origin patterns.
 
 ```typescript
-// Build route patterns from recorded session
-function buildRoutePatterns(session: RecordedSession): Map<string, NetworkEvent[]> {
-  const routeMap = new Map<string, NetworkEvent[]>(); // pattern → FIFO queue
+// Build FIFO queues keyed by method + full URL (not just origin)
+function buildNetworkQueues(session: RecordedSession): Map<string, NetworkEvent[]> {
+  const queues = new Map<string, NetworkEvent[]>(); // "METHOD:fullUrl" → FIFO queue
   for (const event of session.events) {
     if (event.type !== 'network' || event.event.type !== 'request') continue;
-    const url = new URL(event.event.url);
-    const origin = url.origin;
-    const key = `${event.event.method}:${origin}`;
-    if (!routeMap.has(key)) routeMap.set(key, []);
+    const key = `${event.event.method}:${event.event.url}`;
+    if (!queues.has(key)) queues.set(key, []);
     // Find matching response
     const response = findResponse(session.events, event.event.requestId);
-    if (response) routeMap.get(key)!.push(response);
+    if (response) queues.get(key)!.push(response);
   }
-  return routeMap;
+  return queues;
 }
 
 // Register routes per origin (NOT catch-all)
@@ -695,9 +773,8 @@ async function registerRoutes(context: BrowserContext, session: RecordedSession,
     }
   }
 
-  // FIFO queues per URL+method
-  const queues = new Map<string, NetworkEvent[]>();
-  // ... populate from session ...
+  // FIFO queues keyed by "METHOD:fullUrl" — same key format used in lookup below
+  const queues = buildNetworkQueues(session);
 
   for (const origin of origins) {
     // Targeted pattern: only intercept this specific origin
@@ -1268,7 +1345,7 @@ class BlobStore {
 
 ### Lessons from Existing Projects
 
-| Project | Key Lesson for Tripwire |
+| Project | Key Lesson for Eyespy |
 |---------|------------------------|
 | **OpenReplay** | Direct `window.fetch` replacement (not Proxy). `Response.clone()` before consuming. Worker thread for heavy processing. |
 | **Sentry** | 10K mutation/10s throttle prevents runaway recording. Breadcrumb model for event buffering. |
@@ -1290,9 +1367,9 @@ class BlobStore {
 // src/cli/index.ts
 const program = new Command();
 program
-  .name('tripwire')
+  .name('eyespy')
   .version(VERSION)
-  .option('--config <path>', 'Config file path', '.tripwire/config.json')
+  .option('--config <path>', 'Config file path', '.eyespy/config.json')
   .option('--json', 'Force JSON output (auto-detected when piped)')
   .option('--no-color', 'Disable colors')
   .option('-v, --verbose', 'Verbose logging');
@@ -1331,7 +1408,7 @@ Matches pytest's 0/1/2 convention. GitHub Actions treats 1 and 2 identically as 
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="Tripwire" tests="5" failures="2" errors="0" time="12.34">
+<testsuites name="Eyespy" tests="5" failures="2" errors="0" time="12.34">
   <testsuite name="homepage" tests="3" failures="1" errors="0" time="5.67">
     <testcase name="hero-section" classname="homepage" time="1.23"/>
     <testcase name="navigation" classname="homepage" time="2.01">
@@ -1350,7 +1427,7 @@ Use `junit-report-builder` npm package. GitLab requires `<testsuites>` wrapper (
 
 1. Template HTML with `{{css}}`, `{{js}}`, `{{data}}` placeholders
 2. Bundled viewer app (vanilla JS or Preact, ~5KB) injected inline
-3. Report data as `window.__TRIPWIRE_DATA__` JSON blob
+3. Report data as `window.__EYESPY_DATA__` JSON blob
 4. Images as `data:image/png;base64,...` data URLs
 
 Four viewer modes: side-by-side, slider (CSS `clip-path`), blend (opacity crossfade), toggle (click to switch).
@@ -1371,20 +1448,20 @@ jobs:
       - uses: actions/setup-node@v5
         with: { node-version: 'lts/*' }
       - run: npm ci
-      - name: Run Tripwire
-        run: npx tripwire ci --junit results.xml --html report.html
+      - name: Run Eyespy
+        run: npx eyespy ci --junit results.xml --html report.html
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: tripwire-report
+          name: eyespy-report
           path: |
             report.html
-            .tripwire/runs/latest/diffs/
+            .eyespy/runs/latest/diffs/
           retention-days: 30
       - uses: dorny/test-reporter@v1
         if: ${{ !cancelled() }}
         with:
-          name: Tripwire Results
+          name: Eyespy Results
           path: results.xml
           reporter: java-junit
 ```
@@ -1405,8 +1482,8 @@ const result = await esbuild.build({
   entryPoints: ['src/index.ts'],
   bundle: true,
   format: 'iife',
-  globalName: 'Tripwire',
-  outfile: 'dist/tripwire.min.js',
+  globalName: 'Eyespy',
+  outfile: 'dist/eyespy.min.js',
   platform: 'browser',
   target: ['es2020'],           // Not ES5 — see rationale below
   minify: true,
@@ -1420,7 +1497,7 @@ const result = await esbuild.build({
 });
 
 // Size budget enforcement
-const output = readFileSync('dist/tripwire.min.js');
+const output = readFileSync('dist/eyespy.min.js');
 const gzipped = gzipSync(output);
 const sizeKB = (gzipped.length / 1024).toFixed(2);
 console.log(`Bundle: ${(output.length / 1024).toFixed(2)}KB min / ${sizeKB}KB gz`);
@@ -1442,8 +1519,8 @@ Budget breakdown: 18KB gz total = ~3KB fflate + ~15KB recording logic. Tight but
 // .size-limit.js
 module.exports = [
   {
-    name: 'Tripwire Recorder SDK (gzipped)',
-    path: 'packages/recorder-sdk/dist/tripwire.min.js',
+    name: 'Eyespy Recorder SDK (gzipped)',
+    path: 'packages/recorder-sdk/dist/eyespy.min.js',
     limit: '18 KB',
     gzip: true,
   },
@@ -1588,9 +1665,9 @@ Set `resetOnNavigation: false` to accumulate coverage across SPA navigations wit
 **Goal**: Validate that deterministic replay produces pixel-identical screenshots.
 
 Single file (`proof-of-concept.ts`, ~200 lines) that:
-1. Launches Playwright with full anti-flake flags (`--font-render-hinting=none`, `--disable-gpu`, etc.)
+1. Launches Playwright with `--deterministic-mode` + full anti-flake flags (`--font-render-hinting=none`, `--disable-gpu`, etc.)
 2. Injects PRNG seeding via `addInitScript()` (Math.random, crypto.randomUUID, crypto.getRandomValues)
-3. Installs `clock.install()` with fixed time
+3. Installs `clock.install()` with fixed time + patches for `document.timeline.currentTime` and `MessageChannel`
 4. Navigates to TodoMVC React, performs 5 hardcoded actions
 5. Takes screenshots after each action with DOM settle-wait
 6. Runs the sequence 10 times in Docker
@@ -1605,21 +1682,24 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 
 ### Phase 1a: MVP (3-4 weeks, 1-2 developers)
 
-**Goal**: `npx tripwire record --url <url>` → `npx tripwire ci --url <url>` → HTML diff report.
+**Goal**: `npx eyespy record --url <url>` → `npx eyespy ci --url <url>` → HTML diff report.
 
 **Week 1: Foundation**
 - Monorepo scaffolding (pnpm workspaces, Turborepo, Biome, Vitest)
-- `@tripwire/shared`: Frozen TypeScript interfaces (`RecordedSession`, `RecordedEvent`, `SelectorBundle`, `DiffResult`, `RunResult`, config schema), seeded PRNG (xoshiro128** for browser injection, xoshiro256** for Node), flat file storage helpers
-- `.tripwire/` directory structure, `tripwire init` auto-creation
+- `@eyespy/shared`: Frozen TypeScript interfaces (`RecordedSession` with `formatVersion`, `RecordedEvent`, `SelectorBundle`, `DiffResult`, `RunResult`, config schema), seeded PRNG (xoshiro128** for browser injection, xoshiro256** for Node), content-addressable blob store (~100 lines)
+- `.eyespy/` directory structure, `eyespy init` auto-creation (config.json + baselines.json + .gitignore updates)
 
 **Week 2: Replay Engine (CRITICAL PATH)**
-- Playwright launcher with full anti-flake flags + `animations: 'disabled'`
+- Playwright launcher with `--deterministic-mode` + full anti-flake flags + `animations: 'disabled'`
 - PRNG injection via `context.addInitScript()` (Math.random, crypto.randomUUID, crypto.getRandomValues)
 - Full `clock.install()` with `pauseAt`/`runFor`/`resume` lifecycle (Playwright >= 1.48)
-- HTTP network mocking (targeted per-origin routes via `browserContext.route()`, FIFO queue matching)
+- Clock gap patches via `addInitScript()`: `document.timeline.currentTime` (#38951), `MessageChannel` timing
+- HTTP network mocking (targeted per-origin routes via `browserContext.route()`, FIFO queue by method+fullUrl)
 - **Block unrecorded origins** (abort in mock mode)
+- Fresh browser context per session (no localStorage/IndexedDB/cookies bleed)
 - DOM settle detection (MutationObserver + rAF + font loading + img.complete, 300ms quiescence)
-- Screenshot capture
+- Tiered screenshot capture with stabilization loop (two-consecutive-identical)
+- Smart retry (1x replay, re-confirm diffs 2x, majority vote — default ON)
 - Basic auto-healing (strategies 1-5: primary retry, testid, role+label, role+text, text+tag)
 - Navigation timeout recovery (diagnostic screenshot, log pending requests, mark as error)
 - Hard timeouts: 120s/session, 30s/navigation
@@ -1630,14 +1710,14 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 - *Diff engine*: pixelmatch + sharp integration, SHA-256 hash shortcircuit, dimension check (error if mismatch), HTML report with base64-inlined images (inline for <= 30 screenshots, folder-based for > 30).
 
 **Week 4: CLI Integration + CI**
-- CLI commands: `init`, `record`, `replay`, `diff`, `approve`, `ci`, `status`
+- CLI commands: `init`, `record`, `replay`, `diff`, `approve`, `ci`, `status`, `push-baselines`, `pull-baselines`
 - Exit codes 0/1/2
 - JSON output when piped (`!process.stdout.isTTY`)
 - Progress bars (cli-progress) + spinners (ora), suppressed in JSON mode
 - GitHub Actions workflow example with Playwright Docker image
 - E2E test: Record on TodoMVC → replay → approve baselines → change CSS → replay → detect diff
 
-**Exit criteria**: A developer can `npm install @tripwire/cli`, run `tripwire record --url http://localhost:3000`, click around, then `tripwire ci --url http://localhost:3000`, and get an HTML report showing visual diffs. Works in GitHub Actions with `--ipc=host`.
+**Exit criteria**: A developer can `npm install @eyespy/cli`, run `eyespy record --url http://localhost:3000`, click around, then `eyespy ci --url http://localhost:3000`, and get an HTML report showing visual diffs. Works in GitHub Actions with `--ipc=host`.
 
 ---
 
@@ -1652,30 +1732,29 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 - Source map resolution: parse source maps to build `scriptUrl → localFilePath` mapping
 - Greedy set cover algorithm (BitSet-optimized)
 - Coverage-guided session skipping (TurboSnap equivalent, using source map resolution)
-- `tripwire generate` command
+- `eyespy generate` command
 - Staleness detection: invalidate only when `bundleContentHash` changes
 
 **Track 2: Recording SDK + Advanced Mocking**
 - Browser SDK (fetch/XHR monkey-patch, event capture, selector generation, transport)
 - esbuild → < 18KB gzipped IIFE with `size-limit` enforcement
 - Privacy controls: header stripping, configurable field deny-list, production kill switch, mutation throttle
-- `tripwire record --listen` always-on receiver
+- `eyespy record --listen` always-on receiver
 - WebSocket mocking via `page.routeWebSocket()` (Playwright 1.48+)
 - SSE mocking via `addInitScript()` EventSource replacement
 - Framework testing: React 18/19, Next.js 14/15, Vue 3, Angular 17+ (zone.js ordering), Svelte 5
 
 **Track 3: Polish**
-- Content-addressable blob storage (SHA-256 dedup, 2-level sharding)
-- Smart retry (1x + re-confirm diffs 2x, majority vote)
+- Remote baseline storage: `eyespy push-baselines` / `eyespy pull-baselines` with pluggable `StorageBackend` (S3/R2/MinIO)
 - Advanced auto-healing (full 9-strategy cascade, healing overlay, confidence scoring, dependency graph, skip-cascade propagation, 30% abort threshold)
 - Region masking for dynamic content
 - JUnit XML report for CI dashboards
-- `tripwire prune` with retention policies
-- `tripwire sanitize` for sharing sessions
+- `eyespy prune` with retention policies
+- `eyespy sanitize` for sharing sessions
 - Fuzzy URL matching for network mock misses (ignore timestamp/nonce params)
 - Folder-based HTML report for large suites
 
-**Exit criteria**: `tripwire generate` produces a minimal test suite from 50+ sessions. Session skipping achieves 80%+ time savings. Storage dedup achieves 60%+ savings.
+**Exit criteria**: `eyespy generate` produces a minimal test suite from 50+ sessions. Session skipping achieves 80%+ time savings. Storage dedup achieves 60%+ savings.
 
 ---
 
@@ -1709,7 +1788,9 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 | Risk | Severity | Mitigation |
 |------|----------|-----------|
 | **No Math.random/crypto seeding** | P0 | `addInitScript()` seeded PRNG. Table-stakes. Validated in Phase 0 PoC. |
-| **Clock API edge cases (post-#31924 fix)** | P0 | Full `clock.install()` on >= 1.47. Fix landed but is "best-effort". Phase 0 PoC validates. Fallback: Date-only mock via `addInitScript()` if edge cases hit. |
+| **Clock API edge cases (post-#31924 fix)** | P0 | Full `clock.install()` on >= 1.48. Fix landed but is "best-effort". Phase 0 PoC validates. Custom `addInitScript` patches for `document.timeline.currentTime` (#38951) and `MessageChannel` timing (React 18+ scheduler). Fallback: Date-only mock via `addInitScript()` if edge cases hit. |
+| **`--deterministic-mode` flag availability** | P0 | Meta-flag sets 6 compositor/animation flags. Verify presence in target Playwright Chromium version during Phase 0 PoC. If missing, set component flags individually. |
+| **Baseline blob availability (team sharing)** | P1 | `baselines.json` manifest is git-tracked but actual PNGs are in local blob store (gitignored). Teams need `eyespy pull-baselines` before first CI run. Document onboarding. Remote storage (S3/R2) is pluggable. |
 | **catch-all route causes flakiness (#22338)** | P0 | Targeted per-origin routes, not `**/*`. |
 | **CORS preflights bypass routes (#37245)** | P0 | Document limitation. Playwright auto-fulfills OPTIONS with 204 when interception active. |
 | **Network mock miss (request not in recording)** | P0 | Log diagnostic, abort request in mock mode. Fuzzy URL matching (Phase 1b) for timestamp/nonce params. Report all misses in run summary. |
@@ -1718,11 +1799,11 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 | **Source map resolution (blocks session skipping)** | P0 | Parse source maps during coverage collection to build scriptUrl → localFilePath mapping. Without this, TurboSnap equivalent can't work. Deferred to Phase 1b. |
 | **SDK initialization race** | P0 | Must be first script. Runtime proxy verification. Periodic re-check. (Phase 1b — SDK not in Phase 1a) |
 | **No production kill switch** | P0 | allowedHosts + default 0% sampling. (Phase 1b — SDK not in Phase 1a) |
-| **Response body security** | P1 | Strip sensitive headers (Auth, Cookie, Set-Cookie). Keep bodies intact for replay. Document risk. `tripwire sanitize` command (Phase 1b) for sharing sessions. Production kill switch prevents accidental prod recording. |
+| **Response body security** | P1 | Strip sensitive headers (Auth, Cookie, Set-Cookie). Keep bodies intact for replay. Document risk. `eyespy sanitize` command (Phase 1b) for sharing sessions. Production kill switch prevents accidental prod recording. |
 | **Coverage bitmap staleness** | P1 | Version-stamp with `bundleContentHash` (NOT git SHA). Only invalidate when bundle changes. If >50% stale and unreplayable, fall back to "replay all". |
 | **Storage explosion** | P1 | SHA-256 dedup (Phase 1b) + retention + session skipping. Flat file storage in Phase 1a is acceptable at MVP scale (< 20 sessions). |
 | **Screenshot dimension mismatch** | P1 | Explicit dimension check before diffing. Report as error, don't attempt resize. |
-| **Local vs CI baseline divergence** | P1 | Mandate Docker for CI baselines. Document that local runs may differ. Don't allow `tripwire approve` on non-Docker environments by default (override: `--force`). |
+| **Local vs CI baseline divergence** | P1 | Mandate Docker for CI baselines. Document that local runs may differ. Don't allow `eyespy approve` on non-Docker environments by default (override: `--force`). |
 | **HTML report size (> 30 screenshots)** | P1 | Auto-switch to folder-based report. Inline base64 only for small suites. |
 | Font rendering varies across machines | P1 | Mandate Playwright Docker image for CI. Full flag set (`--font-render-hinting=none` etc). Variable fonts have known Docker issues (#29596) — prefer static font files. |
 | Angular zone.js conflict | P1 | Document init ordering. (Phase 1b — SDK not in Phase 1a) |
@@ -1739,7 +1820,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 
 1. **Multi-origin sessions**: OAuth redirects lose recording context. Separate sessions for V1.
 2. **Baseline branching**: Single baseline set for V1. Branch-aware in Phase 2.
-3. **SDK receiver port**: `tripwire record --listen` spins up a temp HTTP server. Default port 8479, configurable via `--port`.
+3. **SDK receiver port**: `eyespy record --listen` spins up a temp HTTP server. Default port 8479, configurable via `--port`.
 4. **CI concurrency sharding**: At > 100 sessions, need to shard across multiple CI jobs. Design the sharding mechanism (session ID ranges? round-robin?) before Phase 1b ships.
 5. **Phase 2 PostgreSQL schema**: Design the server-side schema during Phase 1b even if not implemented until Phase 2. Retrofitting a schema onto an existing CLI data model causes impedance mismatch.
 
@@ -1747,7 +1828,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 
 Two PRNG variants are used for different contexts:
 - **xoshiro128\*\*** (32-bit, 4x32-bit state): Injected into browser pages via `addInitScript()`. JS lacks native 64-bit integers, so 32-bit is correct. Used for `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID` seeding.
-- **xoshiro256\*\*** (64-bit, 4x64-bit state): Used in Node.js for `@tripwire/shared` PRNG module. Powers the `derive()` function for independent child PRNG streams (one per session, one per subsystem). Uses BigInt for full 64-bit precision.
+- **xoshiro256\*\*** (64-bit, 4x64-bit state): Used in Node.js for `@eyespy/shared` PRNG module. Powers the `derive()` function for independent child PRNG streams (one per session, one per subsystem). Uses BigInt for full 64-bit precision.
 
 ---
 

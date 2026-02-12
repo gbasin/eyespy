@@ -35,6 +35,7 @@ No open-source alternative provides the full pipeline. Lost Pixel, Argos CI, and
 - **Auto-healing replay**: Basic fallback cascade in 1a, advanced healing overlay + confidence scoring in 1b
 - **Response bodies**: No size limit, store in blobs. Strip sensitive headers only (Auth, Cookie, Set-Cookie). Document security implications. No body redaction (breaks replay).
 - **Shared package**: Types + shared logic (selector matching, session validation, network normalization)
+- **Recording UX**: Minimal floating overlay ("Stop Recording" button + event counter, z-index max). Ctrl+C in terminal also stops. Overlay excluded from screenshots and selector generation.
 - Scope: Standard SPAs + common widgets. Out of scope for V1: cross-origin iframes, WebGL, PWAs/Service Workers
 
 ---
@@ -212,7 +213,7 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - **Clock lifecycle per screenshot**: `clock.pauseAt()` before capture (freeze all timers), take stabilized screenshot, `clock.resume()` before next interaction.
 - Configurable via `screenshotStrategy` in config: `"tiered"` (default), `"every"` (every event), `"manual"` (only explicit `screenshot-marker` events)
 
-**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times to confirm. Majority vote (2-of-3 must show diff for it to count). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.**
+**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times to confirm. Majority vote (2-of-3 must show diff for it to count). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.** Coverage collection is OFF during retry attempts — we already have the coverage bitmap from the first replay. Retry attempts exist solely to confirm/reject visual diffs.
 
 **Fresh context per retry** (critical implementation detail): FIFO network queues are consumed by `.shift()` during replay — after the first replay, all queues are empty. Each retry attempt MUST:
 1. Create a fresh `BrowserContext` (no shared state from previous attempt)
@@ -226,7 +227,7 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 
 **Coverage limitation (mocked network)**: V8 coverage tracks which branches execute. With network mocking, responses come from FIFO queues, not real servers. If the app has different code paths for different response shapes/timings/errors, coverage won't capture all production paths. This is inherent — coverage reflects the recorded session's behavior, not all possible behaviors. Document this to users.
 
-**DOM settle detection**: MutationObserver + requestAnimationFrame drain. Wait for 300ms of no DOM changes. Also wait for `document.fonts.ready`, `img.complete` on visible images, and rAF drain (two frames). **Clock interaction**: The settle detection runs inside `page.evaluate()` where `Date.now()` is mocked. Use `page.waitForTimeout()` (real time) as the outer timeout wrapper to prevent hangs when clock is paused.
+**DOM settle detection**: **Node.js orchestrated polling** — NOT a single `page.evaluate()` with timers (which would hang when clock is paused). Install a MutationObserver that sets a boolean flag on DOM changes. Poll from Node.js every 50ms using `page.waitForTimeout()` (real wall-clock time), checking the flag via instant `page.evaluate()` calls. After 300ms of no DOM changes, check `document.fonts.ready` and `img.complete` on visible images. All timer-based waits happen in Node.js, not in the browser where they'd be frozen by `clock.pauseAt()`.
 
 **Resource constraints**: Chrome uses 3-20GB RAM per instance. Default concurrency: `Math.min(2, Math.floor(os.totalmem() / 5GB))`. Hard timeout: 120s per session replay, 30s per navigation.
 
@@ -343,11 +344,11 @@ eyespy pull-baselines              # Download baseline blobs from remote
 ```
 Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash), has(hash) }`. Built-in: local filesystem (default), S3-compatible (AWS S3, Cloudflare R2, MinIO, Backblaze B2). Designed following reg-suit's plugin architecture.
 
-**CI cold start (missing blobs)**: When `baselines.json` exists (git-tracked) but referenced blob files are missing (new developer clone, fresh CI without `pull-baselines`), auto-detect and handle gracefully:
+**CI cold start (missing blobs)**: When `baselines.json` exists (git-tracked) but referenced blob files are missing (new developer clone, fresh CI), auto-detect and handle gracefully:
 1. On `eyespy ci` / `eyespy diff`: Check if all hashes in `baselines.json` exist in local blob store
-2. If any missing: print warning `"⚠ N baseline blobs missing. Run 'eyespy pull-baselines' or 'eyespy approve' to establish local baselines. Treating all screenshots as new."`
-3. Treat all screenshots as "new" (no diff possible), exit 0 (not exit 1 — missing blobs aren't a regression)
-4. If remote storage is configured but `pull-baselines` wasn't run: suggest `eyespy pull-baselines` in the warning
+2. **If remote storage is configured**: Auto-pull missing blobs before diffing (`eyespy ci` implicitly runs `pull-baselines` for any missing hashes). Print `"Pulling N missing baseline blobs from remote..."`. This is the expected CI flow — no manual step needed.
+3. If no remote configured and blobs missing: print warning `"⚠ N baseline blobs missing. Configure remote storage or run 'eyespy approve' to establish local baselines. Treating all screenshots as new."`
+4. Treat unresolvable screenshots as "new" (no diff possible), exit 0 (not exit 1 — missing blobs aren't a regression)
 5. First `eyespy approve` after a fresh clone populates the blob store from current screenshots
 
 **Dedup**: All binary artifacts stored by SHA-256 hash. Same screenshot across runs stored once. **Expected savings: 60-80%.**
@@ -633,127 +634,29 @@ function verifyInterception(): { fetch: boolean; xhr: boolean; ws: boolean } {
 // Call after DOMContentLoaded, warn if any are false
 ```
 
-### Playwright Recorder: CDP-Based Event Capture
+### Playwright Recorder: Page-Level Event Capture
 
-The CLI recorder (`eyespy record --url`) uses Playwright's CDP session to listen for raw browser input events — the same mechanism Playwright's codegen uses internally. This captures events at the browser level, not the page level, so it works regardless of page JavaScript, Shadow DOM, or framework quirks.
+The CLI recorder (`eyespy record --url`) uses `addInitScript()` to inject capture-phase DOM event listeners into the page — the same approach Playwright's codegen and Meticulous use internally. CDP's `Input` domain only has *commands* (for injecting synthetic input), NOT events for observing user input. All production recording tools (rrweb, Meticulous, OpenReplay) use page-level `addEventListener` in capture phase.
+
+**Recording UX**: When recording starts, the CLI opens a Playwright browser in headed mode. A small floating overlay (absolute-positioned, z-index: 2147483647) shows a "Stop Recording" button + event counter. The overlay is excluded from selector generation and screenshots. Recording also stops on Ctrl+C in the terminal.
+
+**Architecture**: `addInitScript()` injects the event capture script, which communicates back to Node.js via `page.exposeBinding()`. This runs the capture code in the page's main world (not an isolated world), so it sees all DOM elements including those created by frameworks. For Shadow DOM, capture-phase listeners on `document` receive events that bubble out of open shadow roots.
 
 ```typescript
-async function startRecording(page: Page): Promise<RecordedEvent[]> {
+async function startRecording(page: Page, blobStore: BlobStore): Promise<RecordedEvent[]> {
   const events: RecordedEvent[] = [];
-  const cdp = await page.context().newCDPSession(page);
+  let requestCounter = 0;
 
-  // Enable DOM domain for element resolution
-  await cdp.send('DOM.enable');
-
-  // Listen for mouse events at the Input domain level
-  cdp.on('Input.dispatchMouseEvent', async (params) => {
-    if (params.type !== 'mousePressed') return; // Only record clicks, not moves
-
-    // Resolve (x, y) coordinates to a DOM node
-    const { nodeId } = await cdp.send('DOM.getNodeForLocation', {
-      x: Math.round(params.x),
-      y: Math.round(params.y),
-      includeUserAgentShadowDOM: false,
-    });
-
-    // Get node attributes for selector generation
-    const { node } = await cdp.send('DOM.describeNode', { nodeId, depth: 0 });
-
-    // Generate selector bundle from the resolved node
-    const selector = await generateSelectorFromNode(page, cdp, nodeId, node);
-
-    events.push({
-      type: 'click',
-      timestamp: Date.now(),
-      selector,
-      x: params.x,
-      y: params.y,
-      button: params.button || 0,
-      modifiers: {
-        meta: !!(params.modifiers & 4),
-        ctrl: !!(params.modifiers & 2),
-        shift: !!(params.modifiers & 8),
-        alt: !!(params.modifiers & 1),
-      },
-    });
+  // Expose binding for the injected script to send events back to Node.js
+  await page.exposeBinding('__eyespy_recordEvent', async ({ page: p }, event: RecordedEvent) => {
+    events.push(event);
   });
 
-  // Keyboard events via Input domain
-  cdp.on('Input.dispatchKeyEvent', (params) => {
-    if (params.type === 'keyDown') {
-      events.push({
-        type: 'keydown',
-        timestamp: Date.now(),
-        key: params.key || '',
-        code: params.code || '',
-        modifiers: {
-          meta: !!(params.modifiers & 4),
-          ctrl: !!(params.modifiers & 2),
-          shift: !!(params.modifiers & 8),
-          alt: !!(params.modifiers & 1),
-        },
-      });
-    }
-  });
-
-  // Network capture via Playwright's high-level API (simpler than raw CDP)
-  page.on('request', (request) => {
-    events.push({
-      type: 'network',
-      timestamp: Date.now(),
-      event: {
-        type: 'request',
-        requestId: request.url() + ':' + Date.now(), // Unique enough for recording
-        url: request.url(),
-        method: request.method(),
-        headers: sanitizeHeaders(request.headers()),
-        timestamp: Date.now(),
-      },
-    });
-  });
-
-  page.on('response', async (response) => {
-    try {
-      const body = await response.body(); // Async — may fail for redirects
-      const bodyHash = await blobStore.put(body);
-      events.push({
-        type: 'network',
-        timestamp: Date.now(),
-        event: {
-          type: 'response',
-          requestId: response.url() + ':' + Date.now(),
-          url: response.url(),
-          method: response.request().method(),
-          status: response.status(),
-          headers: sanitizeHeaders(response.headers()),
-          bodyHash,
-          durationMs: 0, // Timing not critical for recording
-        },
-      });
-    } catch {} // Some responses have no body (204, redirects)
-  });
-
-  return events; // Caller stops recording on user signal
-}
-```
-
-**Selector generation from CDP node** — Use `DOM.getNodeForLocation` to resolve click coordinates to a DOM element, then generate selectors in-page:
-
-```typescript
-async function generateSelectorFromNode(
-  page: Page, cdp: CDPSession, nodeId: number, node: Protocol.DOM.Node
-): Promise<SelectorBundle> {
-  // Resolve nodeId to a Playwright-usable object
-  const { object } = await cdp.send('DOM.resolveNode', { nodeId });
-  const remoteObjectId = object.objectId;
-
-  // Run selector generation in page context using the resolved element
-  const result = await page.evaluate(
-    ({ objectId }) => {
-      // __eyespy_resolvedElement is set by a helper that maps objectId → element
-      const el = (window as any).__eyespy_resolvedElement;
-      if (!el) return null;
-
+  // Inject capture-phase event listeners via addInitScript
+  // This survives navigations and runs before any page JS
+  await page.context().addInitScript(() => {
+    // Selector generation — runs in page context
+    function generateSelector(el: Element): { primary: string; fallbacks: string[]; fingerprint: any } {
       const strategies: string[] = [];
 
       // Strategy 1: data-testid (highest priority)
@@ -766,29 +669,26 @@ async function generateSelectorFromNode(
       // Strategy 3: role + aria-label
       const role = el.getAttribute('role') || el.tagName.toLowerCase();
       const ariaLabel = el.getAttribute('aria-label');
-      if (ariaLabel) strategies.push(`${role}[aria-label="${ariaLabel}"]`);
+      if (ariaLabel) strategies.push(`[role="${role}"][aria-label="${ariaLabel}"]`);
 
       // Strategy 4: structural CSS path (fallback)
-      // Walk up the tree building a unique path
       function cssPath(element: Element): string {
         const parts: string[] = [];
         let current: Element | null = element;
         while (current && current !== document.body) {
-          let selector = current.tagName.toLowerCase();
+          let sel = current.tagName.toLowerCase();
           if (current.id && !/^[0-9]|[:.]|--/.test(current.id)) {
-            selector = `#${current.id}`;
-            parts.unshift(selector);
+            parts.unshift(`#${current.id}`);
             break;
           }
           const parent = current.parentElement;
           if (parent) {
             const siblings = Array.from(parent.children).filter(c => c.tagName === current!.tagName);
             if (siblings.length > 1) {
-              const idx = siblings.indexOf(current) + 1;
-              selector += `:nth-of-type(${idx})`;
+              sel += `:nth-of-type(${siblings.indexOf(current) + 1})`;
             }
           }
-          parts.unshift(selector);
+          parts.unshift(sel);
           current = parent;
         }
         return parts.join(' > ');
@@ -796,28 +696,157 @@ async function generateSelectorFromNode(
 
       const primary = strategies[0] || cssPath(el);
       const fallbacks = strategies.slice(1);
-      if (!strategies.includes(cssPath(el))) fallbacks.push(cssPath(el));
+      const path = cssPath(el);
+      if (!strategies.includes(path)) fallbacks.push(path);
 
       return {
         primary,
         fallbacks,
         fingerprint: {
-          text: el.innerText?.substring(0, 50),
+          text: (el as HTMLElement).innerText?.substring(0, 50),
           rect: el.getBoundingClientRect().toJSON(),
           tagName: el.tagName.toLowerCase(),
         },
       };
-    },
-    {} // Placeholder — actual element binding happens via CDP
-  );
+    }
 
-  return result || { primary: `body`, fallbacks: [], fingerprint: { tagName: 'body' } };
+    // Skip recording overlay clicks
+    function isRecordingOverlay(el: Element): boolean {
+      return !!(el.closest && el.closest('[data-eyespy-overlay]'));
+    }
+
+    // Capture-phase listeners on document — see events before any stopPropagation
+    document.addEventListener('click', (e) => {
+      const el = e.target as Element;
+      if (!el || isRecordingOverlay(el)) return;
+      (window as any).__eyespy_recordEvent({
+        type: 'click', timestamp: Date.now(), selector: generateSelector(el),
+        x: (e as MouseEvent).clientX, y: (e as MouseEvent).clientY,
+        button: (e as MouseEvent).button,
+        modifiers: { meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey },
+      });
+    }, true); // capture phase
+
+    document.addEventListener('dblclick', (e) => {
+      const el = e.target as Element;
+      if (!el || isRecordingOverlay(el)) return;
+      (window as any).__eyespy_recordEvent({
+        type: 'dblclick', timestamp: Date.now(), selector: generateSelector(el),
+        x: (e as MouseEvent).clientX, y: (e as MouseEvent).clientY,
+      });
+    }, true);
+
+    document.addEventListener('input', (e) => {
+      const el = e.target as Element;
+      if (!el || isRecordingOverlay(el)) return;
+      const value = (el as HTMLInputElement).type === 'password' ? '***' : (el as HTMLInputElement).value;
+      (window as any).__eyespy_recordEvent({
+        type: 'input', timestamp: Date.now(), selector: generateSelector(el),
+        value, inputType: (e as InputEvent).inputType,
+      });
+    }, true);
+
+    document.addEventListener('keydown', (e) => {
+      (window as any).__eyespy_recordEvent({
+        type: 'keydown', timestamp: Date.now(),
+        key: (e as KeyboardEvent).key, code: (e as KeyboardEvent).code,
+        modifiers: { meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey },
+      });
+    }, true);
+
+    document.addEventListener('keyup', (e) => {
+      (window as any).__eyespy_recordEvent({
+        type: 'keyup', timestamp: Date.now(),
+        key: (e as KeyboardEvent).key, code: (e as KeyboardEvent).code,
+      });
+    }, true);
+
+    // Scroll — debounced (capture final position, not every pixel)
+    let scrollTimer: any = null;
+    document.addEventListener('scroll', (e) => {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        const el = e.target === document ? null : e.target as Element;
+        (window as any).__eyespy_recordEvent({
+          type: 'scroll', timestamp: Date.now(),
+          selector: el ? generateSelector(el) : null,
+          x: el ? el.scrollLeft : window.scrollX,
+          y: el ? el.scrollTop : window.scrollY,
+        });
+      }, 100);
+    }, true);
+
+    // Navigation — History API + popstate
+    const _pushState = history.pushState.bind(history);
+    const _replaceState = history.replaceState.bind(history);
+    history.pushState = function(...args: any[]) {
+      _pushState(...args);
+      (window as any).__eyespy_recordEvent({
+        type: 'navigate', timestamp: Date.now(), url: location.href, navigationType: 'push',
+      });
+    };
+    history.replaceState = function(...args: any[]) {
+      _replaceState(...args);
+      (window as any).__eyespy_recordEvent({
+        type: 'navigate', timestamp: Date.now(), url: location.href, navigationType: 'replace',
+      });
+    };
+    window.addEventListener('popstate', () => {
+      (window as any).__eyespy_recordEvent({
+        type: 'navigate', timestamp: Date.now(), url: location.href, navigationType: 'popstate',
+      });
+    });
+  });
+
+  // Network capture via Playwright's high-level API (Node.js side, not page-injected)
+  // This avoids conflicts with app code and captures all traffic including Service Worker bypass
+  const requestMap = new Map<string, { id: string; startTime: number }>();
+
+  page.on('request', (request) => {
+    const requestId = `req_${++requestCounter}`;
+    requestMap.set(request.url() + ':' + request.method(), { id: requestId, startTime: Date.now() });
+    events.push({
+      type: 'network', timestamp: Date.now(),
+      event: {
+        type: 'request', requestId, url: request.url(), method: request.method(),
+        headers: sanitizeHeaders(request.headers()), timestamp: Date.now(),
+      },
+    });
+  });
+
+  page.on('response', async (response) => {
+    const key = response.url() + ':' + response.request().method();
+    const meta = requestMap.get(key);
+    const requestId = meta?.id || `req_${++requestCounter}`;
+    const startTime = meta?.startTime || Date.now();
+    requestMap.delete(key);
+
+    try {
+      const body = await response.body();
+      const bodyHash = await blobStore.put(body);
+      events.push({
+        type: 'network', timestamp: Date.now(),
+        event: {
+          type: 'response', requestId, url: response.url(),
+          method: response.request().method(), status: response.status(),
+          headers: sanitizeHeaders(response.headers()), bodyHash,
+          durationMs: Date.now() - startTime,
+        },
+      });
+    } catch {
+      // Some responses have no body (204, redirects, aborted)
+    }
+  });
+
+  return events; // Caller stops recording on user signal
 }
 ```
 
-**Note on element resolution**: CDP `DOM.getNodeForLocation` returns the topmost element at the given coordinates, accounting for z-index and stacking contexts. This is more reliable than page-side `document.elementFromPoint()` because it works even when the element is inside a Shadow DOM or behind an overlay. The actual element binding between CDP nodeId and page JavaScript uses `DOM.resolveNode` → `Runtime.callFunctionOn` with the resolved `RemoteObjectId`.
+**Why page-level listeners, not CDP**: CDP's `Input` domain provides `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` which are *commands* for injecting synthetic input into a page — NOT events for observing real user input. There is no CDP event that fires when a user clicks or types. Playwright's codegen uses `extendInjectedScript()` which injects page-level DOM event listeners. Meticulous uses rrweb which also uses `addEventListener` on `document`. This is the only viable approach for capturing user interactions.
 
-**Input capture**: The CDP `Input` domain listeners are passive observers — they don't intercept or modify input. The user interacts normally with the page while we record. This is fundamentally different from the SDK approach (which monkey-patches APIs) — CDP recording is invisible to the page.
+**Shadow DOM handling**: Capture-phase listeners on `document` receive events from open Shadow DOM roots via event bubbling/composition. Closed Shadow DOM roots are invisible — document as a known limitation. `event.composedPath()` provides the full path through shadow boundaries.
+
+**Limitations vs SDK approach**: The Playwright recorder captures interactions only while the recording browser is open. The SDK can record production traffic passively. The Playwright recorder has more reliable network capture (via Playwright's API) but less reliable input capture (page-level listeners can miss `stopImmediatePropagation` on capture phase — rare but possible).
 
 ### Recording SDK: Key Data Structures
 
@@ -834,7 +863,10 @@ interface RecordedSession {
   userAgent: string;
   captureMethod: 'playwright' | 'sdk';  // Which recorder produced this session
   events: RecordedEvent[];       // Chronological, monotonic timestamps
-  networkBodies: Record<string, string>; // requestId → blob hash (large bodies stored separately)
+  // Network body storage: Response bodies are always referenced by `bodyHash` on
+  // individual response NetworkEvents, pointing to SHA-256 keys in .eyespy/blobs/.
+  // The SDK receiver converts inline bodies to blob hashes on ingest.
+  // No separate networkBodies map — body references live on the events themselves.
 }
 
 type RecordedEvent =
@@ -1070,50 +1102,59 @@ async function mockWebSockets(page: Page, session: RecordedSession) {
 
 **SSE mocking** — Replace `EventSource` via `addInitScript()` since `route.fulfill()` cannot stream.
 
+**Critical: Clock interaction** — Same issue as WebSocket: this runs in the browser where `setTimeout` is mocked by `clock.install()`. With clock paused, SSE events never fire. Solution: same as WS — the mock stores pending events and exposes a delivery function. The replay orchestrator triggers delivery from Node.js, coordinated with `clock.runFor()`.
+
 ```javascript
 // Injected via page.addInitScript(script, sseRecordings)
 (function(recordings) {
   const _OriginalEventSource = window.EventSource;
+
+  // Registry of active SSE connections for clock-coordinated delivery
+  window.__eyespy_sseInstances = window.__eyespy_sseInstances || [];
 
   class MockEventSource {
     constructor(url, init) {
       this.url = url;
       this.readyState = 0; // CONNECTING
       this._listeners = {};
+      this._pendingEvents = [];
       this.onopen = null;
       this.onmessage = null;
       this.onerror = null;
 
       const recorded = recordings.find(r => url.includes(r.url));
       if (!recorded) {
-        // Fallback to real EventSource if not recorded.
-        // NOTE: Returning an object from a class constructor overrides `this` in JS.
-        // This works but is fragile — the returned object IS the instance.
         return new _OriginalEventSource(url, init);
       }
 
-      // Simulate connection
-      setTimeout(() => {
-        this.readyState = 1; // OPEN
+      // Store pending events for clock-coordinated delivery
+      this._pendingEvents = (recorded.events || []).slice();
+
+      // Register for external delivery
+      window.__eyespy_sseInstances.push(this);
+
+      // Open immediately (no setTimeout — clock may be paused)
+      this.readyState = 1; // OPEN
+      // Defer open event to next microtask (Promise-based, not timer-based)
+      Promise.resolve().then(() => {
         if (this.onopen) this.onopen(new Event('open'));
         this._dispatch('open', new Event('open'));
+      });
+    }
 
-        // Replay recorded events with timing
-        let baseTime = recorded.events[0]?.timestamp || 0;
-        for (const evt of recorded.events) {
-          const delay = evt.timestamp - baseTime;
-          setTimeout(() => {
-            const messageEvent = new MessageEvent(evt.eventType || 'message', {
-              data: evt.data,
-              lastEventId: evt.lastEventId || '',
-            });
-            if (evt.eventType === 'message' && this.onmessage) {
-              this.onmessage(messageEvent);
-            }
-            this._dispatch(evt.eventType || 'message', messageEvent);
-          }, delay);
-        }
-      }, 10);
+    // Called by replay orchestrator via page.evaluate() at the right clock time
+    _deliverNext() {
+      if (this._pendingEvents.length === 0) return false;
+      const evt = this._pendingEvents.shift();
+      const messageEvent = new MessageEvent(evt.eventType || 'message', {
+        data: evt.data,
+        lastEventId: evt.lastEventId || '',
+      });
+      if (evt.eventType === 'message' && this.onmessage) {
+        this.onmessage(messageEvent);
+      }
+      this._dispatch(evt.eventType || 'message', messageEvent);
+      return this._pendingEvents.length > 0;
     }
 
     addEventListener(type, listener) {
@@ -1131,78 +1172,99 @@ async function mockWebSockets(page: Page, session: RecordedSession) {
     close() { this.readyState = 2; }
   }
 
-  // Preserve static properties
   MockEventSource.CONNECTING = 0;
   MockEventSource.OPEN = 1;
   MockEventSource.CLOSED = 2;
   window.EventSource = MockEventSource;
 })(arguments[0]);
+
+// In the replay orchestrator (Node.js side):
+// Between interactions, deliver SSE events at clock-coordinated times:
+//   await page.evaluate(() => {
+//     for (const sse of window.__eyespy_sseInstances || []) {
+//       sse._deliverNext();
+//     }
+//   });
+//   await page.clock.runFor(delta);
 ```
 
 ### Replay Engine: DOM Settle Detection
 
+**Critical clock interaction**: When Playwright's `clock.pauseAt()` is active, ALL browser-side timers are frozen — `setTimeout`, `requestAnimationFrame`, `Date.now()` all return frozen values. A `page.evaluate()` that uses `setTimeout` for quiescence detection **will hang forever**. The settle detection MUST be orchestrated from Node.js using `page.waitForTimeout()` (which uses real wall-clock time) and non-blocking page queries.
+
 ```typescript
+/**
+ * Node.js orchestrated DOM settle detection.
+ *
+ * Instead of a single page.evaluate() with setTimeout/rAF (which hang when
+ * clock is paused), we poll from Node.js using page.waitForTimeout() for
+ * real-time delays and page.evaluate() for instant state checks.
+ */
 async function waitForDomSettle(page: Page, options: { timeout?: number; quiescence?: number } = {}) {
   const { timeout = 10000, quiescence = 300 } = options;
+  const deadline = Date.now() + timeout;
 
-  await page.evaluate(async (quiescenceMs) => {
-    return new Promise<void>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout>;
-      let settled = false;
-      const deadline = Date.now() + 10000; // Hard deadline inside page
-
-      // 1. MutationObserver — detect DOM changes
-      const observer = new MutationObserver(() => {
-        clearTimeout(timer);
-        timer = setTimeout(checkSettle, quiescenceMs);
-      });
-      observer.observe(document.body, {
-        childList: true, subtree: true, attributes: true, characterData: true
-      });
-
-      // 2. Check settle conditions
-      async function checkSettle() {
-        if (settled) return;
-        if (Date.now() > deadline) { finish(); return; }
-
-        // Wait for fonts
-        if (document.fonts.status !== 'loaded') {
-          await document.fonts.ready;
-          timer = setTimeout(checkSettle, quiescenceMs);
-          return;
-        }
-
-        // Wait for visible images
-        const images = Array.from(document.querySelectorAll('img'));
-        const visibleImages = images.filter(img => {
-          const rect = img.getBoundingClientRect();
-          return rect.top < window.innerHeight && rect.bottom > 0;
-        });
-        const unloaded = visibleImages.filter(img => !img.complete);
-        if (unloaded.length > 0) {
-          await Promise.all(unloaded.map(img =>
-            new Promise(r => { img.onload = r; img.onerror = r; })
-          ));
-          timer = setTimeout(checkSettle, quiescenceMs);
-          return;
-        }
-
-        // Wait for rAF drain (one full frame)
-        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-        finish();
-      }
-
-      function finish() {
-        settled = true;
-        observer.disconnect();
-        clearTimeout(timer);
-        resolve();
-      }
-
-      // Start the quiescence timer
-      timer = setTimeout(checkSettle, quiescenceMs);
+  // 1. Install a MutationObserver that sets a flag on any DOM change.
+  //    This runs in-page but doesn't use timers — just sets a boolean.
+  await page.evaluate(() => {
+    (window as any).__eyespy_domChanged = false;
+    if ((window as any).__eyespy_observer) (window as any).__eyespy_observer.disconnect();
+    const observer = new MutationObserver(() => {
+      (window as any).__eyespy_domChanged = true;
     });
-  }, quiescence);
+    observer.observe(document.body, {
+      childList: true, subtree: true, attributes: true, characterData: true
+    });
+    (window as any).__eyespy_observer = observer;
+  });
+
+  // 2. Poll from Node.js: wait quiescence ms, then check if DOM changed
+  let stableMs = 0;
+  while (stableMs < quiescence && Date.now() < deadline) {
+    // Real wall-clock delay (not affected by Playwright clock mock)
+    await page.waitForTimeout(50);
+
+    const changed = await page.evaluate(() => {
+      const changed = (window as any).__eyespy_domChanged;
+      (window as any).__eyespy_domChanged = false; // Reset flag
+      return changed;
+    });
+
+    if (changed) {
+      stableMs = 0; // DOM changed — reset quiescence counter
+    } else {
+      stableMs += 50;
+    }
+  }
+
+  // 3. Check resource loading (instant queries, no timers)
+  const resourcesReady = await page.evaluate(() => {
+    // Fonts
+    if (document.fonts.status !== 'loaded') return false;
+
+    // Visible images
+    const images = Array.from(document.querySelectorAll('img'));
+    const visibleImages = images.filter(img => {
+      const rect = img.getBoundingClientRect();
+      return rect.top < window.innerHeight && rect.bottom > 0;
+    });
+    return visibleImages.every(img => img.complete);
+  });
+
+  // 4. If resources not ready, wait a bit more and re-check
+  if (!resourcesReady && Date.now() < deadline) {
+    await page.waitForTimeout(500); // Give fonts/images time to load
+    // Don't loop — if still not ready after 500ms, proceed anyway
+  }
+
+  // 5. Cleanup observer
+  await page.evaluate(() => {
+    if ((window as any).__eyespy_observer) {
+      (window as any).__eyespy_observer.disconnect();
+      delete (window as any).__eyespy_observer;
+      delete (window as any).__eyespy_domChanged;
+    }
+  });
 }
 ```
 
@@ -1345,6 +1407,8 @@ function popcount8(n: number): number {
 
 ### Coverage: Session Skipping (TurboSnap Equivalent)
 
+**Source map dependency**: Session skipping requires mapping V8 script URLs (e.g., `http://localhost:3000/assets/index-a1b2c3.js`) back to local file paths (e.g., `src/components/App.tsx`). This requires source maps. **When source maps are unavailable** (stripped in production builds, not served by dev server): warn `"Source maps not found for N scripts. Session skipping disabled — replaying all sessions."` and fall back to replaying all sessions. This is safe (slower, not incorrect). Source map resolution runs once during `eyespy generate` and caches the mapping in `.eyespy/coverage/source-map-cache.json`.
+
 ```typescript
 /**
  * Given a git diff and coverage bitmaps, determine which sessions
@@ -1352,7 +1416,8 @@ function popcount8(n: number): number {
  * with changed files can be skipped entirely.
  *
  * Chromatic's TurboSnap traces Webpack module dependency graphs.
- * We use a simpler approach: URL prefix matching on coverage scripts.
+ * We use a simpler approach: source map resolution for URL → file mapping.
+ * Falls back to replaying all sessions when source maps are unavailable.
  */
 function getAffectedSessions(
   changedFiles: string[],       // From `git diff --name-only HEAD~1`
@@ -1670,6 +1735,12 @@ jobs:
       - run: npm ci
       - name: Run Eyespy
         run: npx eyespy ci --junit results.xml --html report.html
+        # Auto-pulls missing baseline blobs from remote storage if configured.
+        # Set EYESPY_REMOTE_BUCKET and AWS credentials for S3/R2 backends.
+        env:
+          EYESPY_REMOTE_BUCKET: ${{ vars.EYESPY_REMOTE_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -1926,7 +1997,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 - **Determinism test**: 10-run identical screenshot assertion in Docker
 
 **Week 3: Recorder + Diff Engine (parallel tracks)**
-- *Playwright Recorder*: CDP-based recording using `CDPSession` — `Input.dispatchMouseEvent`/`Input.dispatchKeyEvent` listeners for raw user events, `DOM.getNodeForLocation(x,y)` to resolve click coordinates to DOM elements, then selector generation on the resolved node. Network via `page.on('request'/'response')` with async `response.body()` capture. Save as `RecordedSession` JSON. Use `addInitScript()` for selector fingerprint helpers (innerText, boundingRect, data-testid resolution).
+- *Playwright Recorder*: Page-level event capture via `addInitScript()` — inject capture-phase DOM event listeners (`click`, `input`, `keydown`, etc.) that fire before any app code. `page.exposeBinding()` sends events back to Node.js. Network via `page.on('request'/'response')` with async `response.body()` capture. Selector generation via in-page `generateSelector()` function (data-testid > id > role+aria > CSS path). Recording overlay (floating "Stop" button) excluded from selectors/screenshots. Save as `RecordedSession` JSON.
 - *Diff engine*: pixelmatch + sharp integration, SHA-256 hash shortcircuit, dimension check (error if mismatch), HTML report with base64-inlined images (inline for <= 30 screenshots, folder-based for > 30).
 
 **Week 4: CLI Integration + CI**
@@ -2031,10 +2102,13 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 | Streaming/chunked responses | P1 | Buffer to string for replay. `route.fulfill()` cannot stream. Document behavioral difference. |
 | Third-party scripts in coverage | P1 | Filter by URL prefix matching app origin (`script.url.startsWith(appOrigin)`). |
 | **FIFO queue depletion on smart retry** | P0 | `.shift()` consumes queue entries. Each retry needs fresh browser context + rebuilt queues from original session data. Validated by architecture: `replaySession()` is a pure function of (session, seed). |
-| **WS/SSE route handlers run in Node.js, not browser** | P0 | `routeWebSocket` handlers use real timers, not mocked clock. Solution: clock-coordinated delivery — send WS messages from replay orchestrator synchronized with `clock.runFor()`, not via setTimeout in handlers. |
+| **WS/SSE handlers run in Node.js (WS) or browser with frozen clock (SSE)** | P0 | WS: `routeWebSocket` handlers use real timers, not mocked clock. SSE: `addInitScript` mock uses browser `setTimeout` which is frozen. Solution for both: clock-coordinated delivery — store pending messages, deliver via replay orchestrator synchronized with `clock.runFor()`. |
+| **Source maps unavailable for session skipping** | P1 | Session skipping requires source maps to map scriptUrl → localFilePath. Production builds often strip source maps. Fallback: warn and replay all sessions. Document that `--enable-source-maps` or serving `.map` files is required for session skipping to work. |
+| **DOM settle detection hangs with paused clock** | P0 | `setTimeout`/`rAF`/`Date.now()` inside `page.evaluate()` are ALL frozen when `clock.pauseAt()` is active. Solution: Node.js orchestrated polling — use `page.waitForTimeout()` (real time) + instant `page.evaluate()` state checks. Never use browser-side timers for settle detection. |
+| **Coverage collected during smart retry** | P1 | Coverage should be OFF during retry attempts (2nd/3rd replays). We already have the bitmap from the first run. Collecting during retries wastes CPU and produces identical results. |
 | **V8 source hash non-determinism across rebuilds** | P1 | Modern bundlers are NOT deterministic (chunk hashing, timestamps). Use `sourceContentHash` from `page.coverage.stopJSCoverage()` output — hash V8's actual executed scripts, not build artifacts. |
 | **CI cold start (missing blobs)** | P1 | `baselines.json` in git but blobs are local. Auto-detect missing blobs, warn, treat all screenshots as "new" (exit 0). Suggest `eyespy pull-baselines`. |
-| **CDP Input domain listener availability** | P1 | CDP `Input.dispatchMouseEvent` listener is how Playwright's codegen works internally. Well-supported. Fallback: page-level event listeners via `addInitScript()` (less reliable for Shadow DOM). |
+| **Page-level event listener interference** | P1 | Recorder uses capture-phase `addEventListener` on `document`. Apps that call `stopImmediatePropagation()` on capture phase can block event recording. Mitigation: inject listeners as the very first script via `addInitScript()` — our listeners register before any app code. If still missed, log a warning about uncaptured interactions. |
 | Canvas/WebGL non-deterministic | Scoped out | Document limitation. Mask canvas regions in diffs. |
 | Cross-origin iframes invisible | Scoped out | Document limitation. Same-origin iframes supported. |
 | Service Workers bypass everything | Scoped out | Block SWs during replay (`serviceWorkers: 'block'`). |
@@ -2077,7 +2151,7 @@ Two PRNG variants are used for different contexts:
 **Phase 1a:**
 2. **Unit tests**: Selector generation, event serialization, network route matching, PRNG seeding, DOM settle detection, pixelmatch integration, HTML report generation
 3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt)
-3b. **CDP recorder tests**: Record a 10-action sequence on TodoMVC via CDP, verify all events captured with correct selectors, verify network bodies stored in blob store, verify round-trip (record → save → load → replay produces matching screenshots)
+3b. **Playwright recorder tests**: Record a 10-action sequence on TodoMVC via page-level event capture, verify all events captured with correct selectors (including events inside open Shadow DOM), verify network bodies stored in blob store, verify round-trip (record → save → load → replay produces matching screenshots), verify recording overlay is excluded from captures
 4. **E2E test**: Record session on TodoMVC → replay → diff → approve baselines → change CSS → replay → detect diff → approve new baselines
 5. **Determinism regression**: 10-run identical screenshot assertion runs in CI on every commit
 
@@ -2103,7 +2177,7 @@ Two PRNG variants are used for different contexts:
 | Coverage bitmap | — | ~150 lines | `v8-to-istanbul` goes to Istanbul format; we skip to bitmaps. |
 | Set cover algorithm | — | ~80 lines | No npm package for bitwise set cover. |
 | Network interception (SDK) | — | ~300 lines | OpenReplay is AGPL, Sentry is 100K+ lines. Build focused impl. |
-| Selector generation | `finder` (MIT) for SDK | Playwright's built-in for recorder | `finder` generates CSS selectors from DOM elements |
+| Selector generation | `finder` (MIT) for SDK | Custom `generateSelector()` for recorder | `finder` for SDK (npm). Recorder uses own in-page function (data-testid > id > role > CSS path) since it runs inside `addInitScript()`. |
 | Compression (SDK) | `fflate` (~3KB gz) | — | Tree-shakeable, browser-native fallback |
 | Bundling | `esbuild` (SDK) + `tsup` (Node) | — | Standard toolchain |
 | Size enforcement | `size-limit` | — | Sentry's approach, GitHub Action for PR comments |

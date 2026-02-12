@@ -162,9 +162,9 @@ Replays recorded sessions in headless Chromium with deterministic environment.
   - `performance.mark()` / `performance.measure()`: Stubbed by clock (return no-ops). Document that Performance Observer / Navigation Timing APIs return empty results.
 - **Playwright `animations: 'disabled'`**: Built-in option that handles CSS animations + CSS transitions + WAAPI. Protocol-level, not CSS injection. Finite animations fast-forwarded to completion. Infinite animations cancelled. No conflict with clock mocking (different layers).
 - Additional anti-flake CSS: `caret-color: transparent; scroll-behavior: auto !important`
-- **Browser flags**: `--deterministic-mode` (meta-flag that sets `--run-all-compositor-stages-before-draw`, `--enable-begin-frame-control`, `--disable-threaded-animation`, `--disable-threaded-scrolling`, `--disable-checker-imaging`, `--disable-image-animation-resync`) plus `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
+- **Browser flags**: Try `--deterministic-mode` first (meta-flag intended to set `--run-all-compositor-stages-before-draw`, `--enable-begin-frame-control`, `--disable-threaded-animation`, `--disable-threaded-scrolling`, `--disable-checker-imaging`, `--disable-image-animation-resync`). **Fallback**: if `--deterministic-mode` is not recognized by the Chromium version bundled with Playwright (verify in Phase 0 PoC), set all 6 component flags individually. Additionally: `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
 - Fixed viewport: 1280x720, deviceScaleFactor: 1
-- **Fresh browser context per session**: Each replay session starts with clean state — no localStorage, IndexedDB, cookies, or Service Workers from previous sessions. `browserContext` created with `storageState: undefined`, `serviceWorkers: 'block'`.
+- **Fresh BrowserContext per session** (NOT a new browser process — reuse the same `Browser` instance for all sessions within a run, create a new `BrowserContext` for each): Each replay session starts with clean state — no localStorage, IndexedDB, cookies, or Service Workers from previous sessions. `browserContext` created with `storageState: undefined`, `serviceWorkers: 'block'`. Smart retry also creates fresh contexts (same browser).
 - **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
@@ -229,6 +229,15 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 
 **DOM settle detection**: **Node.js orchestrated polling** — NOT a single `page.evaluate()` with timers (which would hang when clock is paused). Install a MutationObserver that sets a boolean flag on DOM changes. Poll from Node.js every 50ms using `page.waitForTimeout()` (real wall-clock time), checking the flag via instant `page.evaluate()` calls. After 300ms of no DOM changes, check `document.fonts.ready` and `img.complete` on visible images. All timer-based waits happen in Node.js, not in the browser where they'd be frozen by `clock.pauseAt()`.
 
+**Why `page.waitForTimeout()` is clock-safe**: `page.waitForTimeout(ms)` creates a Node.js-side `setTimeout` on the Playwright controller process. Playwright's `clock.install()` only mocks browser-side timer APIs via CDP. Node.js timers are unaffected — `page.waitForTimeout(50)` always waits 50ms of real wall-clock time regardless of clock state. Similarly, `page.evaluate()` with synchronous code (read a boolean, return it) completes instantly even when clock is paused — it only hangs if the evaluated code itself calls `setTimeout`/`requestAnimationFrame`.
+
+**Error handling during replay** (not just navigation timeout):
+- `page.evaluate()` throws: Catch, log the error + event context, skip interaction (count as failed). Usually means the page crashed or a script error occurred.
+- `route.fulfill()` fails: Catch, log the unmatched request, the route handler continues. Next matching request may also fail — if > 5 consecutive route errors, log diagnostic and switch to `route.abort()` for remaining requests.
+- Browser crash (Chromium OOM, GPU process crash): `page.screenshot()` will throw. Catch at the session level, mark as `replay-error` (exit code 2), continue to next session.
+- `locator.click()` / `.fill()` timeout (default 30s): Treated as interaction failure, count toward the 30% abort threshold.
+- Unexpected popup/dialog: Register `page.on('dialog')` handler that auto-dismisses with `dialog.dismiss()`. Log the dialog message. Don't let a `window.confirm()` block replay.
+
 **Resource constraints**: Chrome uses 3-20GB RAM per instance. Default concurrency: `Math.min(2, Math.floor(os.totalmem() / 5GB))`. Hard timeout: 120s per session replay, 30s per navigation.
 
 ### 3. Test Generator (Coverage-Based Selection)
@@ -242,8 +251,8 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 6. Result: minimal set of K sessions (K << N total) that maximize coverage
 
 **Staleness management**:
-- Bitmaps stamped with code version. If git SHA differs from current HEAD, mark as "stale-pending"
-- On replay against new code: re-collect coverage and update bitmap (self-healing)
+- Bitmaps stamped with `(gitSha, sourceContentHash)`. **Staleness is determined by `sourceContentHash`**, NOT git SHA — git SHA changes every commit even when the actual JavaScript bundle is identical (comment changes, test-only changes, README updates). `sourceContentHash` only changes when the code V8 actually executes changes.
+- On replay against new code: if `sourceContentHash` differs, re-collect coverage and update bitmap (self-healing). If same hash, bitmap is still valid even with a different git SHA.
 - If >50% of sessions are stale and unreplayable, fall back to "replay all"
 - Coverage-guided session skipping (TurboSnap equivalent): only replay sessions whose bitmaps overlap with files changed in the current diff. 80%+ time savings.
 
@@ -297,6 +306,15 @@ eyespy sanitize                                   # Strip response bodies for sh
 ```
 
 **`eyespy init`**: Creates `.eyespy/` directory with default `config.json` and empty `baselines.json` (both git-tracked). Adds `.eyespy/sessions/`, `.eyespy/blobs/`, `.eyespy/runs/`, `.eyespy/coverage/` to `.gitignore`. Auto-runs on first `eyespy record` if not initialized.
+
+**`eyespy approve` workflow**:
+1. Read the latest run's screenshots from `.eyespy/runs/latest/screenshots/`
+2. For each screenshot: compute SHA-256 hash, store in blob store (if not already present)
+3. Update `baselines.json`: set each `session-id/screenshot-name → { hash, width, height }`
+4. Write updated `baselines.json` to disk (git-tracked — user commits it)
+5. With `--session <id>`: approve only that session's screenshots (partial approval)
+6. Print summary: `"Approved N screenshots for M sessions. Run 'git add .eyespy/baselines.json && git commit' to persist."`
+7. **Guard**: By default, refuse to approve on non-Docker environments (screenshots may differ from CI). Override with `--force`. Check via `process.env.container === 'docker'` or presence of `/.dockerenv`.
 
 JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 0 = all pass, 1 = diffs detected, 2 = replay failures.
 
@@ -435,7 +453,7 @@ eyespy/
 │   │       ├── network/       # targeted route mocking, WS, SSE, CORS handling
 │   │       ├── interactions/  # click, input, scroll, navigation, touch executor
 │   │       ├── coverage/      # V8 Profiler, bitmap conversion, version stamping
-│   │       ├── settle/        # MutationObserver + rAF drain + font loading + img.complete
+│   │       ├── settle/        # Node.js orchestrated polling + font loading + img.complete
 │   │       └── screenshot/    # capture, smart retry, majority vote
 │   │
 │   ├── diff-engine/           # pixelmatch + masking + content-hash + HTML report
@@ -800,11 +818,16 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 
   // Network capture via Playwright's high-level API (Node.js side, not page-injected)
   // This avoids conflicts with app code and captures all traffic including Service Worker bypass
-  const requestMap = new Map<string, { id: string; startTime: number }>();
+  //
+  // CRITICAL: Use Request object identity as Map key, NOT url+method string.
+  // String keys collide when multiple concurrent requests hit the same endpoint
+  // (e.g., two parallel POST /api/graphql). response.request() returns the SAME
+  // Request object that fired in the 'request' event, so identity lookup is safe.
+  const requestMap = new Map<Request, { id: string; startTime: number }>();
 
   page.on('request', (request) => {
     const requestId = `req_${++requestCounter}`;
-    requestMap.set(request.url() + ':' + request.method(), { id: requestId, startTime: Date.now() });
+    requestMap.set(request, { id: requestId, startTime: Date.now() });
     events.push({
       type: 'network', timestamp: Date.now(),
       event: {
@@ -815,11 +838,10 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
   });
 
   page.on('response', async (response) => {
-    const key = response.url() + ':' + response.request().method();
-    const meta = requestMap.get(key);
+    const meta = requestMap.get(response.request());
     const requestId = meta?.id || `req_${++requestCounter}`;
     const startTime = meta?.startTime || Date.now();
-    requestMap.delete(key);
+    requestMap.delete(response.request());
 
     try {
       const body = await response.body();
@@ -924,6 +946,14 @@ type NetworkEvent =
 // The bodyHash maps to a SHA-256 key in .eyespy/blobs/.
 ```
 
+**Session validation** (on load, before replay):
+1. Check `formatVersion` — reject with clear error if mismatch (e.g., "Session format v2 requires @eyespy/cli >= 0.3.0")
+2. Verify events are chronologically sorted (monotonic `timestamp`)
+3. Verify all `bodyHash` references exist in blob store — collect missing hashes, warn (not error) with count
+4. Verify session has at least one interaction event (not just network events)
+5. Verify `captureMethod` field exists (old sessions without it: assume `'playwright'`)
+6. Schema validation via TypeScript type guards at runtime (not JSON Schema — too heavy for CLI)
+
 ### Replay Engine: PRNG Seeding
 
 The most critical piece of the determinism stack. Must run before ANY page JavaScript via `addInitScript()`, which uses CDP `Page.addScriptToEvaluateOnNewDocument` internally — guaranteed to execute before page scripts.
@@ -997,12 +1027,24 @@ The most critical piece of the determinism stack. Must run before ANY page JavaS
 **HTTP routes** — Use `browserContext.route()` (survives navigations) with targeted per-origin patterns.
 
 ```typescript
-// Build FIFO queues keyed by method + full URL (not just origin)
+// Normalize URLs for consistent FIFO key matching (Phase 1a: basic normalization)
+// Without this, trivial differences (trailing slash, default port, param order) cause mock misses.
+function normalizeUrl(rawUrl: string): string {
+  const url = new URL(rawUrl);
+  url.hash = '';                          // Strip fragment
+  if (url.port === '80' && url.protocol === 'http:') url.port = '';
+  if (url.port === '443' && url.protocol === 'https:') url.port = '';
+  url.pathname = url.pathname.replace(/\/+$/, '') || '/'; // Normalize trailing slashes
+  url.searchParams.sort();                // Deterministic param order
+  return url.toString();
+}
+
+// Build FIFO queues keyed by method + normalized URL
 function buildNetworkQueues(session: RecordedSession): Map<string, NetworkEvent[]> {
-  const queues = new Map<string, NetworkEvent[]>(); // "METHOD:fullUrl" → FIFO queue
+  const queues = new Map<string, NetworkEvent[]>(); // "METHOD:normalizedUrl" → FIFO queue
   for (const event of session.events) {
     if (event.type !== 'network' || event.event.type !== 'request') continue;
-    const key = `${event.event.method}:${event.event.url}`;
+    const key = `${event.event.method}:${normalizeUrl(event.event.url)}`;
     if (!queues.has(key)) queues.set(key, []);
     // Find matching response
     const response = findResponse(session.events, event.event.requestId);
@@ -1020,14 +1062,14 @@ async function registerRoutes(context: BrowserContext, session: RecordedSession,
     }
   }
 
-  // FIFO queues keyed by "METHOD:fullUrl" — same key format used in lookup below
+  // FIFO queues keyed by "METHOD:normalizedUrl" — same normalization used in lookup below
   const queues = buildNetworkQueues(session);
 
   for (const origin of origins) {
     // Targeted pattern: only intercept this specific origin
     await context.route(`**/${new URL(origin).host}/**`, async (route) => {
       const request = route.request();
-      const key = `${request.method()}:${request.url()}`;
+      const key = `${request.method()}:${normalizeUrl(request.url())}`;
       const queue = queues.get(key);
 
       if (queue && queue.length > 0) {
@@ -1265,6 +1307,277 @@ async function waitForDomSettle(page: Page, options: { timeout?: number; quiesce
       delete (window as any).__eyespy_domChanged;
     }
   });
+}
+```
+
+### Replay Orchestrator (Main Loop)
+
+The orchestrator ties together PRNG seeding, clock control, network mocking, interaction dispatch, WS/SSE delivery, DOM settle, and screenshot capture. This is the most complex component — getting the ordering wrong breaks determinism.
+
+```typescript
+/**
+ * Replay a single session. Pure function of (session, seed) — each call is
+ * independent (critical for smart retry). Returns screenshots + optional coverage.
+ */
+async function replaySession(
+  browser: Browser,
+  session: RecordedSession,
+  seed: string,
+  options: { collectCoverage: boolean; mode: 'mock' | 'live'; screenshotStrategy: string },
+): Promise<ReplayResult> {
+  // 1. Fresh BrowserContext (clean state, no bleed between sessions/retries)
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 720 },
+    deviceScaleFactor: 1,
+    serviceWorkers: 'block',
+    // animations: 'disabled' is set here
+  });
+
+  // 2. Determinism setup — ORDER MATTERS
+  //    addInitScript runs before page JS on every navigation, in registration order.
+  await context.addInitScript(PRNG_SEED_SCRIPT, seed);
+  await context.addInitScript(CLOCK_GAP_PATCHES); // document.timeline, MessageChannel
+  await context.addInitScript(SSE_MOCK_SCRIPT, extractSseRecordings(session));
+
+  // 3. Network mocking — register routes on context (survives navigations)
+  const queues = buildNetworkQueues(session); // Fresh queues (not consumed by previous attempt)
+  await registerRoutes(context, queues, options.mode);
+
+  // 4. Create page, install clock BEFORE any navigation
+  const page = await context.newPage();
+  const startTime = new Date(session.startedAt);
+  await page.clock.install({ time: startTime });
+  await page.clock.pauseAt(startTime);
+
+  // 5. WebSocket mocking (requires page for routeWebSocket)
+  const wsHandles = await mockWebSockets(page, session);
+
+  // 6. Coverage (first attempt only — caller passes collectCoverage: false for retries)
+  if (options.collectCoverage) {
+    await page.coverage.startJSCoverage({ resetOnNavigation: false });
+  }
+
+  const screenshots = new Map<string, Buffer>();
+  const healingLog: HealingEvent[] = [];
+  let failedInteractions = 0;
+  let totalInteractions = 0;
+  let screenshotIndex = 1;
+  let lastEventTimestamp = 0;
+
+  // 7. Navigate to starting URL
+  try {
+    await page.goto(session.url, { waitUntil: 'commit', timeout: 30000 });
+  } catch (e) {
+    // Navigation timeout recovery
+    const diag = await page.screenshot().catch(() => null);
+    await context.close();
+    return { status: 'replay-error', reason: `Navigation to ${session.url} failed: ${e.message}`, diagnosticScreenshot: diag };
+  }
+
+  await waitForDomSettle(page);
+  screenshots.set(`${pad(screenshotIndex++)}-page-load`, await captureStableScreenshot(page));
+
+  // 8. Replay interactions in chronological order
+  const interactions = session.events.filter(e => e.type !== 'network');
+
+  for (const event of interactions) {
+    // Advance mocked clock to this event's time
+    const delta = event.timestamp - lastEventTimestamp;
+    if (delta > 0) {
+      // Deliver any pending WS/SSE messages due during this time window
+      await deliverPendingMessages(page, wsHandles, lastEventTimestamp, event.timestamp);
+      await page.clock.runFor(delta);
+    }
+    lastEventTimestamp = event.timestamp;
+
+    // Dispatch the interaction
+    totalInteractions++;
+    try {
+      await dispatchInteraction(page, event, healingLog);
+    } catch (e) {
+      failedInteractions++;
+      healingLog.push({ event, error: e.message, skipped: true });
+      if (totalInteractions >= 5 && failedInteractions / totalInteractions > 0.3) {
+        await context.close();
+        return { status: 'unreplayable', reason: `>${Math.round(failedInteractions/totalInteractions*100)}% interactions failed`, healingLog };
+      }
+      continue; // Skip failed interaction
+    }
+
+    // Wait for DOM to settle
+    await waitForDomSettle(page);
+
+    // Tiered screenshot capture
+    if (shouldCaptureScreenshot(event, options.screenshotStrategy)) {
+      await page.clock.pauseAt(new Date(startTime.getTime() + event.timestamp));
+      screenshots.set(`${pad(screenshotIndex++)}-${event.type}`, await captureStableScreenshot(page));
+    }
+  }
+
+  // 9. Final screenshot (always)
+  await page.clock.pauseAt(new Date(startTime.getTime() + lastEventTimestamp));
+  screenshots.set(`${pad(screenshotIndex++)}-end`, await captureStableScreenshot(page));
+
+  // 10. Coverage collection
+  let coverage: CoverageBitmap | undefined;
+  if (options.collectCoverage) {
+    const raw = await page.coverage.stopJSCoverage();
+    coverage = v8ToBitmap(raw, new URL(session.url).origin);
+  }
+
+  await context.close();
+  return { status: 'success', screenshots, coverage, healingLog };
+}
+
+/**
+ * Stabilization loop — take consecutive identical screenshots.
+ * Absorbs remaining compositor/rendering timing variance.
+ */
+async function captureStableScreenshot(page: Page, maxAttempts = 5, timeoutMs = 3000): Promise<Buffer> {
+  let previous = await page.screenshot({ type: 'png' });
+  const deadline = Date.now() + timeoutMs;
+
+  for (let i = 1; i < maxAttempts && Date.now() < deadline; i++) {
+    await page.waitForTimeout(100); // Real time — not affected by clock mock
+    const current = await page.screenshot({ type: 'png' });
+    if (Buffer.compare(previous, current) === 0) return current; // Stable
+    previous = current;
+  }
+  return previous; // Best effort after max attempts
+}
+
+/**
+ * Map recorded events to Playwright actions.
+ * Auto-healing: try primary selector, then fallback cascade.
+ */
+async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog: HealingEvent[]): Promise<void> {
+  switch (event.type) {
+    case 'click': {
+      const locator = await resolveSelector(page, event.selector, healingLog);
+      await locator.click({ button: buttonName(event.button), modifiers: toModifiers(event.modifiers) });
+      break;
+    }
+    case 'input': {
+      const locator = await resolveSelector(page, event.selector, healingLog);
+      await locator.fill(event.value);
+      break;
+    }
+    case 'keydown':
+      await page.keyboard.down(event.key);
+      break;
+    case 'keyup':
+      await page.keyboard.up(event.key);
+      break;
+    case 'scroll': {
+      if (event.selector) {
+        const locator = await resolveSelector(page, event.selector, healingLog);
+        await locator.evaluate((el, { x, y }) => { el.scrollTo(x, y); }, { x: event.x, y: event.y });
+      } else {
+        await page.evaluate(({ x, y }) => window.scrollTo(x, y), { x: event.x, y: event.y });
+      }
+      break;
+    }
+    case 'navigate':
+      await page.goto(event.url, { waitUntil: 'commit', timeout: 30000 });
+      break;
+    // ... dblclick, focus, blur, pointer, touch, drag, paste, copy, cut follow same pattern
+  }
+}
+
+/**
+ * Deliver WS/SSE messages that should arrive between lastTime and currentTime.
+ * Messages are delivered immediately (not via setTimeout) — clock timing is
+ * controlled by the orchestrator's clock.runFor() calls.
+ */
+async function deliverPendingMessages(
+  page: Page,
+  wsHandles: Map<string, { ws: WebSocketRoute; pending: NetworkEvent[] }>,
+  fromTimestamp: number,
+  toTimestamp: number,
+): Promise<void> {
+  // WebSocket messages (Node.js side — real timers, deliver immediately)
+  for (const [url, handle] of wsHandles) {
+    while (handle.pending.length > 0 && handle.pending[0].timestamp <= toTimestamp) {
+      const msg = handle.pending.shift()!;
+      handle.ws.send(msg.data);
+    }
+  }
+  // SSE messages (browser side — deliver via page.evaluate)
+  await page.evaluate((ts) => {
+    for (const sse of (window as any).__eyespy_sseInstances || []) {
+      while (sse._pendingEvents.length > 0 && sse._pendingEvents[0].timestamp <= ts) {
+        sse._deliverNext();
+      }
+    }
+  }, toTimestamp);
+}
+
+function pad(n: number): string { return String(n).padStart(3, '0'); }
+```
+
+**Smart retry orchestration** (wraps `replaySession`):
+```typescript
+async function replayWithRetry(browser: Browser, session: RecordedSession, seed: string, baselines: BaselineManifest): Promise<FinalResult> {
+  // First attempt: collect coverage + screenshots
+  const first = await replaySession(browser, session, seed, { collectCoverage: true, mode: 'mock', screenshotStrategy: 'tiered' });
+  if (first.status !== 'success') return first;
+
+  // Diff against baselines
+  const diffs = await diffScreenshots(first.screenshots, baselines, session.id);
+  const diffedKeys = diffs.filter(d => d.exceedsThreshold).map(d => d.key);
+
+  if (diffedKeys.length === 0) return { ...first, diffs }; // All pass — done
+
+  // Retry: replay 2 more times, only compare the specific screenshots that diffed
+  const retryResults: Map<string, Buffer>[] = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const retry = await replaySession(browser, session, seed, { collectCoverage: false, mode: 'mock', screenshotStrategy: 'tiered' });
+    if (retry.status === 'success') retryResults.push(retry.screenshots);
+  }
+
+  // Majority vote: diff must appear in 2-of-3 attempts to count
+  const confirmedDiffs = diffedKeys.filter(key => {
+    let diffCount = 1; // First attempt already showed diff
+    for (const screenshots of retryResults) {
+      const shot = screenshots.get(key);
+      if (shot) {
+        const baseline = baselines.getHash(session.id, key);
+        const hash = sha256(shot);
+        if (hash !== baseline) diffCount++;
+      }
+    }
+    return diffCount >= 2; // 2-of-3 must agree
+  });
+
+  return { ...first, confirmedDiffs, totalAttempts: 1 + retryResults.length };
+}
+```
+
+**Screenshot strategy decision function** (implements the tiered capture described above):
+```typescript
+function shouldCaptureScreenshot(event: RecordedEvent, strategy: string): boolean {
+  if (strategy === 'every') return true;
+  if (strategy === 'manual') return event.type === 'screenshot-marker';
+
+  // 'tiered' (default):
+  switch (event.type) {
+    case 'navigate':        return true;  // Always capture after navigation
+    case 'click':           return true;  // Capture with stabilization
+    case 'dblclick':        return true;
+    // Input: only capture on blur/submit (handled by next event), not mid-typing
+    case 'input':           return false;
+    case 'keydown':         return false;
+    case 'keyup':           return false;
+    case 'scroll':          return false;
+    case 'pointermove':     return false;
+    case 'touchmove':       return false;
+    case 'focus':           return false;
+    case 'blur':            return true;  // Capture after input sequence completes
+    case 'paste':           return true;  // Content change
+    case 'drop':            return true;  // Content change
+    case 'screenshot-marker': return true;
+    default:                return false;
+  }
 }
 ```
 
@@ -1639,7 +1952,7 @@ class BlobStore {
 | **PostHog** | Privacy-first: opt-in recording, mask all inputs by default, `data-ph-no-capture` attribute. |
 | **Lost Pixel** | Baseline directory per test with sequential numbering (`001-*.png`). Update command that moves current → baseline. |
 | **Argos CI** | Dual-threshold diffing: lenient pass first (skip clearly identical), strict pass on remainder. Reduces compute 60-80%. |
-| **Chromatic (TurboSnap)** | Traces Webpack dependency graph to skip unaffected stories. Our URL-prefix approach is simpler but less precise. |
+| **Chromatic (TurboSnap)** | Traces Webpack dependency graph to skip unaffected stories. Our source-map-based approach is simpler (no bundler plugin needed) but requires source maps to be served. |
 | **Playwright** | `addInitScript()` = CDP `Page.addScriptToEvaluateOnNewDocument` — runs before ANY page JS. `animations: 'disabled'` is protocol-level, not CSS injection. `toHaveScreenshot()` waits for consecutive identical screenshots — could borrow for settle detection. |
 | **v8-to-istanbul** | Coverage conversion: V8 byte ranges → Istanbul function/branch/statement maps. We skip Istanbul format entirely — go straight to bitmaps. |
 | **pixelmatch** | Requires raw RGBA buffers (sharp for conversion). YIQ color space for perceptual accuracy. Anti-aliasing detection reduces false positives by ~30%. |
@@ -1804,6 +2117,23 @@ if (gzipped.length > 18 * 1024) {
 
 Budget breakdown: 18KB gz total = ~3KB fflate + ~15KB recording logic. Tight but achievable — rrweb core is 40-50KB min but our scope is narrower.
 
+**Detailed size estimate** (gzipped):
+| Component | Estimate | Notes |
+|-----------|----------|-------|
+| fflate (gzip only) | ~3KB | Tree-shaked import |
+| Fetch interception | ~1KB | Monkey-patch + clone + record |
+| XHR interception | ~1KB | Prototype patch pattern |
+| WS/SSE interception | ~1.5KB | Proxy constructors |
+| Event capture (15 types) | ~2.5KB | Listeners + handlers |
+| Selector generation | ~1.5KB | 4-strategy generator |
+| Transport (batch + retry) | ~2KB | Fetch + beacon + circuit breaker |
+| Privacy controls | ~1KB | Header strip + field masking |
+| Session lifecycle | ~0.5KB | Init + flush + metadata |
+| Compression bridge | ~0.5KB | CompressionStream detection |
+| **Total** | **~14.5KB** | **3.5KB buffer** |
+
+If budget is exceeded: first cut is WS/SSE interception (Phase 1b only), saving ~1.5KB. Second cut: simplify selector generation to `data-testid` + `id` + CSS path only (drop role+aria), saving ~0.5KB.
+
 **size-limit for CI** (Sentry's approach):
 
 ```javascript
@@ -1955,19 +2285,24 @@ Set `resetOnNavigation: false` to accumulate coverage across SPA navigations wit
 
 **Goal**: Validate that deterministic replay produces pixel-identical screenshots.
 
-Single file (`proof-of-concept.ts`, ~200 lines) that:
-1. Launches Playwright with `--deterministic-mode` + full anti-flake flags (`--font-render-hinting=none`, `--disable-gpu`, etc.)
+Single file (`proof-of-concept.ts`, ~300 lines) that:
+1. Launches Playwright, tests `--deterministic-mode` flag — if Chromium rejects it, fall back to the 6 individual compositor flags. **Log which path was taken.**
 2. Injects PRNG seeding via `addInitScript()` (Math.random, crypto.randomUUID, crypto.getRandomValues)
 3. Installs `clock.install()` with fixed time + patches for `document.timeline.currentTime` and `MessageChannel`
-4. Navigates to TodoMVC React, performs 5 hardcoded actions
-5. Takes screenshots after each action with DOM settle-wait
-6. Runs the sequence 10 times in Docker
+4. **Test A**: Navigate to TodoMVC React (tests React 18 MessageChannel scheduler), perform 5 hardcoded actions, take screenshots after each with DOM settle-wait (Node.js orchestrated polling)
+5. **Test B**: Navigate to a page with `crypto.randomUUID()` + animated CSS + `Date.now()` display — verify all are deterministic
+6. Runs each test 10 times in Docker
 7. Compares all screenshots with pixelmatch
-8. Reports: 0 diff pixels = success. Any diff = must debug before proceeding.
+8. Reports: 0 diff pixels = success. Any diff = log which screenshot and which pixels differ for debugging.
 
-**Exit criteria**: 10/10 runs produce pixel-identical screenshots in the Playwright Docker image.
+**Exit criteria**: 10/10 runs produce pixel-identical screenshots in the Playwright Docker image for BOTH test apps.
 
-**Risk being validated**: Deterministic replay is achievable with Playwright's stack without forking Chromium. **If this fails, the entire product concept needs re-evaluation.**
+**Risks being validated** (any failure = stop and investigate before proceeding):
+- Deterministic replay with Playwright's stack (no Chromium fork)
+- `clock.install()` + `MessageChannel` patch works with React 18 scheduler
+- Node.js orchestrated polling works with paused clock
+- `--deterministic-mode` or individual compositor flags produce stable screenshots
+- PRNG seeding catches `crypto.randomUUID()` before any page JS
 
 ---
 
@@ -1988,7 +2323,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 - HTTP network mocking (targeted per-origin routes via `browserContext.route()`, FIFO queue by method+fullUrl)
 - **Block unrecorded origins** (abort in mock mode)
 - Fresh browser context per session (no localStorage/IndexedDB/cookies bleed)
-- DOM settle detection (MutationObserver + rAF + font loading + img.complete, 300ms quiescence)
+- DOM settle detection (Node.js orchestrated polling: MutationObserver flag + `page.waitForTimeout()` real-time polling + font loading + img.complete, 300ms quiescence)
 - Tiered screenshot capture with stabilization loop (two-consecutive-identical)
 - Smart retry (1x replay, re-confirm diffs 2x, majority vote — default ON)
 - Basic auto-healing (strategies 1-5: primary retry, testid, role+label, role+text, text+tag)
@@ -2063,7 +2398,7 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 
 ### Phase 3: Scale + Polish
 
-- S3-compatible blob storage
+- Blob storage CDN + replication (S3 Cross-Region, CloudFront for read-heavy CI)
 - Horizontal worker scaling + CI job sharding for > 100 sessions
 - Coverage treemap in dashboard
 - Session playback viewer
@@ -2122,6 +2457,8 @@ Single file (`proof-of-concept.ts`, ~200 lines) that:
 3. **SDK receiver port**: `eyespy record --listen` spins up a temp HTTP server. Default port 8479, configurable via `--port`.
 4. **CI concurrency sharding**: At > 100 sessions, need to shard across multiple CI jobs. Design the sharding mechanism (session ID ranges? round-robin?) before Phase 1b ships.
 5. **Phase 2 PostgreSQL schema**: Design the server-side schema during Phase 1b even if not implemented until Phase 2. Retrofitting a schema onto an existing CLI data model causes impedance mismatch.
+6. **Replay target URL differs from recording URL**: Sessions record against `http://localhost:3000` but CI may use a different host/port (Docker networking, preview deployments). Need URL rewriting: `eyespy replay --url http://ci-container:3000` should remap recorded navigation URLs and network origins. Phase 1a: simple host:port replacement. Phase 1b: configurable URL mapping.
+7. **Concurrent recording + replay**: Can a user record new sessions while replaying old ones? Currently no resource conflict (different browser instances), but both write to `.eyespy/blobs/` — blob store's atomic write (write → rename) handles this safely. Document as supported.
 
 ## PRNG Design Note
 
@@ -2150,7 +2487,7 @@ Two PRNG variants are used for different contexts:
 
 **Phase 1a:**
 2. **Unit tests**: Selector generation, event serialization, network route matching, PRNG seeding, DOM settle detection, pixelmatch integration, HTML report generation
-3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt)
+3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt), URL normalization for FIFO matching (trailing slashes, default ports, query param ordering)
 3b. **Playwright recorder tests**: Record a 10-action sequence on TodoMVC via page-level event capture, verify all events captured with correct selectors (including events inside open Shadow DOM), verify network bodies stored in blob store, verify round-trip (record → save → load → replay produces matching screenshots), verify recording overlay is excluded from captures
 4. **E2E test**: Record session on TodoMVC → replay → diff → approve baselines → change CSS → replay → detect diff → approve new baselines
 5. **Determinism regression**: 10-run identical screenshot assertion runs in CI on every commit

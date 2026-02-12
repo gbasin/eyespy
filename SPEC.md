@@ -497,6 +497,13 @@ const _originalFetch = window.fetch.bind(window);
 const _originalXHROpen = XMLHttpRequest.prototype.open;
 const _originalXHRSend = XMLHttpRequest.prototype.send;
 
+// SDK timestamps are relative to session start (ms offset, NOT epoch).
+// The SDK session manager sets this when recording begins.
+// IMPORTANT: All `Date.now()` calls below should use `sdkTs()` in production code.
+// Shown as `Date.now()` in snippets for brevity — the SDK implementation replaces all with sdkTs().
+let _sessionStartTime = Date.now();
+function sdkTs() { return Date.now() - _sessionStartTime; }
+
 window.fetch = function(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
   const method = init?.method || 'GET';
@@ -735,12 +742,16 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       return !!(el.closest && el.closest('[data-eyespy-overlay]'));
     }
 
+    // Session start time — all event timestamps are offsets from this
+    const sessionStartTime = Date.now();
+    function ts() { return Date.now() - sessionStartTime; }
+
     // Capture-phase listeners on document — see events before any stopPropagation
     document.addEventListener('click', (e) => {
       const el = e.target as Element;
       if (!el || isRecordingOverlay(el)) return;
       (window as any).__eyespy_recordEvent({
-        type: 'click', timestamp: Date.now(), selector: generateSelector(el),
+        type: 'click', timestamp: ts(), selector: generateSelector(el),
         x: (e as MouseEvent).clientX, y: (e as MouseEvent).clientY,
         button: (e as MouseEvent).button,
         modifiers: { meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey },
@@ -751,7 +762,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       const el = e.target as Element;
       if (!el || isRecordingOverlay(el)) return;
       (window as any).__eyespy_recordEvent({
-        type: 'dblclick', timestamp: Date.now(), selector: generateSelector(el),
+        type: 'dblclick', timestamp: ts(), selector: generateSelector(el),
         x: (e as MouseEvent).clientX, y: (e as MouseEvent).clientY,
       });
     }, true);
@@ -761,14 +772,14 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       if (!el || isRecordingOverlay(el)) return;
       const value = (el as HTMLInputElement).type === 'password' ? '***' : (el as HTMLInputElement).value;
       (window as any).__eyespy_recordEvent({
-        type: 'input', timestamp: Date.now(), selector: generateSelector(el),
+        type: 'input', timestamp: ts(), selector: generateSelector(el),
         value, inputType: (e as InputEvent).inputType,
       });
     }, true);
 
     document.addEventListener('keydown', (e) => {
       (window as any).__eyespy_recordEvent({
-        type: 'keydown', timestamp: Date.now(),
+        type: 'keydown', timestamp: ts(),
         key: (e as KeyboardEvent).key, code: (e as KeyboardEvent).code,
         modifiers: { meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey },
       });
@@ -776,7 +787,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 
     document.addEventListener('keyup', (e) => {
       (window as any).__eyespy_recordEvent({
-        type: 'keyup', timestamp: Date.now(),
+        type: 'keyup', timestamp: ts(),
         key: (e as KeyboardEvent).key, code: (e as KeyboardEvent).code,
       });
     }, true);
@@ -788,7 +799,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       scrollTimer = setTimeout(() => {
         const el = e.target === document ? null : e.target as Element;
         (window as any).__eyespy_recordEvent({
-          type: 'scroll', timestamp: Date.now(),
+          type: 'scroll', timestamp: ts(),
           selector: el ? generateSelector(el) : null,
           x: el ? el.scrollLeft : window.scrollX,
           y: el ? el.scrollTop : window.scrollY,
@@ -802,18 +813,18 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
     history.pushState = function(...args: any[]) {
       _pushState(...args);
       (window as any).__eyespy_recordEvent({
-        type: 'navigate', timestamp: Date.now(), url: location.href, navigationType: 'push',
+        type: 'navigate', timestamp: ts(), url: location.href, navigationType: 'push',
       });
     };
     history.replaceState = function(...args: any[]) {
       _replaceState(...args);
       (window as any).__eyespy_recordEvent({
-        type: 'navigate', timestamp: Date.now(), url: location.href, navigationType: 'replace',
+        type: 'navigate', timestamp: ts(), url: location.href, navigationType: 'replace',
       });
     };
     window.addEventListener('popstate', () => {
       (window as any).__eyespy_recordEvent({
-        type: 'navigate', timestamp: Date.now(), url: location.href, navigationType: 'popstate',
+        type: 'navigate', timestamp: ts(), url: location.href, navigationType: 'popstate',
       });
     });
   });
@@ -826,15 +837,17 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
   // (e.g., two parallel POST /api/graphql). response.request() returns the SAME
   // Request object that fired in the 'request' event, so identity lookup is safe.
   const requestMap = new Map<Request, { id: string; startTime: number }>();
+  const sessionStartMs = Date.now(); // All timestamps relative to this
+  const relTs = () => Date.now() - sessionStartMs;
 
   page.on('request', (request) => {
     const requestId = `req_${++requestCounter}`;
     requestMap.set(request, { id: requestId, startTime: Date.now() });
     events.push({
-      type: 'network', timestamp: Date.now(),
+      type: 'network', timestamp: relTs(),
       event: {
         type: 'request', requestId, url: request.url(), method: request.method(),
-        headers: sanitizeHeaders(request.headers()), timestamp: Date.now(),
+        headers: sanitizeHeaders(request.headers()), timestamp: relTs(),
       },
     });
   });
@@ -849,7 +862,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       const body = await response.body();
       const bodyHash = await blobStore.put(body);
       events.push({
-        type: 'network', timestamp: Date.now(),
+        type: 'network', timestamp: relTs(),
         event: {
           type: 'response', requestId, url: response.url(),
           method: response.request().method(), status: response.status(),
@@ -874,19 +887,21 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 
 ### Recording SDK: Key Data Structures
 
-**Session format** — Flat event array with monotonic timestamps. Network bodies stored separately in blobs.
+**Session format** — Flat event array with **relative timestamps** (milliseconds from session start). Network bodies stored separately in blobs.
+
+**Timestamp convention**: All `timestamp` fields in `RecordedEvent` are **milliseconds from session start** (offset, NOT absolute epoch). Recorders compute: `timestamp = Date.now() - sessionStartTime`. This makes sessions portable (replayable regardless of when they were recorded) and makes the orchestrator's delta calculation trivial (`delta = event.timestamp - lastEventTimestamp`, starting from 0). The orchestrator advances the mocked clock by `delta` ms between events, and pauses at `new Date(startTime.getTime() + event.timestamp)` for screenshots — both formulas are correct because `event.timestamp` is an offset.
 
 ```typescript
 interface RecordedSession {
   formatVersion: 1;              // Schema version — reject with clear error if mismatch
   id: string;                    // UUID v4
-  startedAt: string;             // ISO 8601
+  startedAt: string;             // ISO 8601 — absolute wall-clock time of session start
   endedAt: string;
   url: string;                   // Starting URL
   viewport: { width: number; height: number };
   userAgent: string;
   captureMethod: 'playwright' | 'sdk';  // Which recorder produced this session
-  events: RecordedEvent[];       // Chronological, monotonic timestamps
+  events: RecordedEvent[];       // Chronological, monotonic timestamps (ms from session start)
   // Network body storage: Response bodies are always referenced by `bodyHash` on
   // individual response NetworkEvents, pointing to SHA-256 keys in .eyespy/blobs/.
   // The SDK receiver converts inline bodies to blob hashes on ingest.
@@ -937,7 +952,7 @@ interface Modifiers {
 
 type NetworkEvent =
   | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; timestamp: number }
-  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash: string; durationMs: number; error?: string }
+  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash?: string; durationMs: number; error?: string }
   | { type: 'ws-open'; wsId: string; url: string; timestamp: number }
   | { type: 'ws-send'; wsId: string; url: string; data: string; timestamp: number }
   | { type: 'ws-receive'; wsId: string; url: string; data: string; timestamp: number }
@@ -1117,11 +1132,11 @@ async function registerRoutes(
 
       if (queue && queue.length > 0) {
         const recorded = queue.shift()!;
-        const body = await loadBlob(recorded.bodyHash); // From content-addressable store
+        const body = recorded.bodyHash ? await blobStore.get(recorded.bodyHash) : undefined;
         await route.fulfill({
           status: recorded.status,
           headers: recorded.headers,
-          body: body,
+          body,
         });
       } else if (mode === 'mock') {
         await route.abort('connectionrefused');
@@ -1366,7 +1381,7 @@ async function replaySession(
   browser: Browser,
   session: RecordedSession,
   seed: string,
-  options: { collectCoverage: boolean; mode: 'mock' | 'live'; screenshotStrategy: string },
+  options: { collectCoverage: boolean; mode: 'mock' | 'live'; screenshotStrategy: string; targetUrl?: string; viewport?: { width: number; height: number } },
 ): Promise<ReplayResult> {
   // 1. Fresh BrowserContext (clean state, no bleed between sessions/retries)
   const context = await browser.newContext({
@@ -1382,13 +1397,22 @@ async function replaySession(
   await context.addInitScript(SSE_MOCK_SCRIPT, extractSseRecordings(session));
 
   // 3. Network mocking — register routes on context (survives navigations)
-  const queues = buildNetworkQueues(session); // Fresh queues (not consumed by previous attempt)
+  //    Note: FIFO queue keys use RECORDED URLs (not remapped). Route handlers intercept
+  //    requests to the RECORDED origins. When the app makes requests to third-party APIs
+  //    (Stripe, S3), those URLs are the same in recording and replay. The app origin
+  //    routes are NOT intercepted — those go to the real replay server at targetUrl.
+  //    Only third-party API traffic flows through the mock.
+  const queues = buildNetworkQueues(session);
   await registerRoutes(context, queues, options.mode);
 
   // 4. Create page, install clock BEFORE any navigation
   const page = await context.newPage();
   const startTime = new Date(session.startedAt);
-  await page.clock.install({ time: startTime });
+  // CRITICAL: Install clock 1s BEFORE target time to avoid Playwright #33926 race condition.
+  // Between install() and pauseAt(), the clock runs. If both use the same time, pauseAt
+  // can fail with "Cannot fast-forward to the past" when the clock advances past startTime
+  // in the gap between the two CDP calls.
+  await page.clock.install({ time: new Date(startTime.getTime() - 1000) });
   await page.clock.pauseAt(startTime);
 
   // 5. WebSocket mocking (requires page for routeWebSocket)
@@ -1406,14 +1430,20 @@ async function replaySession(
   let screenshotIndex = 1;
   let lastEventTimestamp = 0;
 
-  // 7. Navigate to starting URL
+  // 6b. URL remapping (recorded origin → replay target origin)
+  // The caller passes options.targetUrl (from --url flag). If different from session.url origin,
+  // all app-origin URLs are remapped. Third-party origins unchanged.
+  const remapUrl = createUrlRemapper(session.url, options.targetUrl ?? session.url);
+
+  // 7. Navigate to starting URL (with origin remapping)
+  const startUrl = remapUrl(session.url);
   try {
-    await page.goto(session.url, { waitUntil: 'commit', timeout: 30000 });
+    await page.goto(startUrl, { waitUntil: 'commit', timeout: 30000 });
   } catch (e) {
     // Navigation timeout recovery
     const diag = await page.screenshot().catch(() => null);
     await context.close();
-    return { status: 'replay-error', reason: `Navigation to ${session.url} failed: ${e.message}`, diagnosticScreenshot: diag };
+    return { status: 'replay-error', reason: `Navigation to ${startUrl} failed: ${e.message}`, diagnosticScreenshot: diag };
   }
 
   await waitForDomSettle(page);
@@ -1523,7 +1553,9 @@ async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog:
       break;
     }
     case 'navigate':
-      await page.goto(event.url, { waitUntil: 'commit', timeout: 30000 });
+      // Apply URL remapping: replace recorded app origin with replay target origin.
+      // Third-party URLs (Stripe, etc.) are unchanged. See Open Question 6.
+      await page.goto(remapUrl(event.url), { waitUntil: 'commit', timeout: 30000 });
       break;
     // ... dblclick, focus, blur, pointer, touch, drag, paste, copy, cut follow same pattern
   }
@@ -1628,6 +1660,64 @@ async function deliverPendingMessages(
 
 function pad(n: number): string { return String(n).padStart(3, '0'); }
 
+// URL remapping: replace recorded app origin with replay target origin.
+// Initialized by orchestrator caller: remapUrl = createUrlRemapper(session.url, targetUrl);
+// Third-party origins (Stripe, S3, etc.) pass through unchanged.
+function createUrlRemapper(recordedBaseUrl: string, replayBaseUrl: string) {
+  const recordedOrigin = new URL(recordedBaseUrl).origin;
+  const replayOrigin = new URL(replayBaseUrl).origin;
+  if (recordedOrigin === replayOrigin) return (url: string) => url; // No-op
+  return (url: string) => {
+    try {
+      const parsed = new URL(url);
+      if (parsed.origin === recordedOrigin) {
+        return url.replace(recordedOrigin, replayOrigin);
+      }
+      return url; // Third-party — unchanged
+    } catch { return url; }
+  };
+}
+// Note: `remapUrl` is created by the orchestrator caller and passed to dispatchInteraction
+// via closure or options. The initial page.goto also uses it.
+
+// Build branch index from extracted branches for session skipping
+function buildBranchIndex(branches: Array<{ scriptUrl: string; start: number; end: number }>): BranchIndex {
+  const entries: Record<number, { scriptUrl: string; startOffset: number; endOffset: number }> = {};
+  for (let i = 0; i < branches.length; i++) {
+    entries[i] = { scriptUrl: branches[i].scriptUrl, startOffset: branches[i].start, endOffset: branches[i].end };
+  }
+  return { entries };
+}
+
+// Extract SSE recordings from session for addInitScript injection
+function extractSseRecordings(session: RecordedSession): Array<{ url: string; events: NetworkEvent[] }> {
+  const sseMap = new Map<string, { url: string; events: NetworkEvent[] }>();
+  for (const event of session.events) {
+    if (event.type !== 'network') continue;
+    if (event.event.type === 'sse-open') {
+      sseMap.set(event.event.sseId, { url: event.event.url, events: [] });
+    } else if (event.event.type === 'sse-event') {
+      const entry = sseMap.get(event.event.sseId);
+      if (entry) entry.events.push(event.event);
+    }
+  }
+  return Array.from(sseMap.values());
+}
+
+// Find WebSocket timeline for a given URL from pre-built timelines
+function findWsTimeline(wsTimelines: Map<string, NetworkEvent[]>, url: string): NetworkEvent[] | undefined {
+  for (const [wsId, events] of wsTimelines) {
+    const openEvent = events.find(e => e.type === 'ws-open');
+    if (openEvent && openEvent.url === url) return events;
+  }
+  return undefined;
+}
+
+// SHA-256 hash of a Buffer
+function sha256(data: Buffer): string {
+  return createHash('sha256').update(data).digest('hex');
+}
+
 // Utility: escape string for use in RegExp constructor
 function escapeRegex(str: string): string { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
@@ -1647,13 +1737,68 @@ function toModifiers(m: Modifiers): Array<'Alt' | 'Control' | 'Meta' | 'Shift'> 
 }
 ```
 
-**Diffing in-memory screenshots against baselines**: The orchestrator has `Map<string, Buffer>` (screenshots) but baselines are SHA-256 hashes in `baselines.json` pointing to blobs on disk. The bridge:
-1. For each screenshot Buffer, compute its SHA-256 hash
-2. Look up the baseline hash from `baselines.getHash(sessionId, key)`
-3. If hashes match → identical, skip pixelmatch
-4. If hashes differ → write both Buffers to temp files, run `compareScreenshots()`, store diff image
-5. Clean up temp files after comparison
-This avoids writing all screenshots to disk — only differing ones touch the filesystem.
+**Diffing in-memory screenshots against baselines**: The orchestrator has `Map<string, Buffer>` (screenshots) but baselines are SHA-256 hashes in `baselines.json` pointing to blobs on disk. The bridge uses `sharp(Buffer)` directly (sharp accepts both file paths and Buffers):
+
+```typescript
+interface ScreenshotDiff {
+  key: string;                   // e.g., "001-page-load"
+  identical: boolean;
+  exceedsThreshold: boolean;
+  diffPixels?: number;
+  diffRatio?: number;
+  currentHash: string;
+  baselineHash?: string;
+  diffImageHash?: string;
+}
+
+type FinalResult =
+  | ReplayResult & { diffs?: ScreenshotDiff[]; confirmedDiffs?: string[]; totalAttempts?: number };
+
+async function diffScreenshots(
+  screenshots: Map<string, Buffer>,
+  baselines: BaselineManifest,
+  sessionId: string,
+  blobStore: BlobStore,
+  diffOptions: { threshold?: number; maxDiffPixelRatio?: number } = {},
+): Promise<ScreenshotDiff[]> {
+  const results: ScreenshotDiff[] = [];
+  for (const [key, buffer] of screenshots) {
+    const currentHash = sha256(buffer);
+    const baselineHash = baselines.getHash(sessionId, key);
+
+    if (!baselineHash) {
+      results.push({ key, identical: false, exceedsThreshold: false, currentHash, baselineHash: undefined });
+      continue; // New screenshot — no baseline to compare against
+    }
+
+    if (currentHash === baselineHash) {
+      results.push({ key, identical: true, exceedsThreshold: false, currentHash, baselineHash });
+      continue; // Hash match — skip pixelmatch
+    }
+
+    // Hash mismatch — run pixel comparison using Buffers directly (sharp accepts Buffer)
+    const baselineBuffer = await blobStore.get(baselineHash);
+    const diff = await compareScreenshotsFromBuffers(baselineBuffer, buffer, diffOptions);
+    results.push({ key, ...diff, currentHash, baselineHash });
+  }
+  return results;
+}
+```
+
+**`compareScreenshots` Buffer variant**: The diff engine accepts both file paths and Buffers. `sharp()` accepts either, so the core comparison function works on raw data:
+
+```typescript
+async function compareScreenshotsFromBuffers(
+  baseline: Buffer, current: Buffer, options: { threshold?: number; maxDiffPixelRatio?: number } = {}
+): Promise<{ identical: boolean; exceedsThreshold: boolean; diffPixels: number; diffRatio: number; diffImageHash?: string }> {
+  // sharp accepts Buffer directly — no temp files needed
+  const [baseRaw, curRaw] = await Promise.all([
+    sharp(baseline).raw().ensureAlpha().toBuffer({ resolveWithObject: true }),
+    sharp(current).raw().ensureAlpha().toBuffer({ resolveWithObject: true }),
+  ]);
+  // ... same pixelmatch logic as compareScreenshots ...
+}
+```
 
 **Smart retry orchestration** (wraps `replaySession`):
 ```typescript
@@ -1663,7 +1808,7 @@ async function replayWithRetry(browser: Browser, session: RecordedSession, seed:
   if (first.status !== 'success') return first;
 
   // Diff against baselines
-  const diffs = await diffScreenshots(first.screenshots, baselines, session.id);
+  const diffs = await diffScreenshots(first.screenshots, baselines, session.id, blobStore);
   const diffedKeys = diffs.filter(d => d.exceedsThreshold).map(d => d.key);
 
   if (diffedKeys.length === 0) return { ...first, diffs }; // All pass — done
@@ -1709,11 +1854,19 @@ function shouldCaptureScreenshot(event: RecordedEvent, strategy: string): boolea
     case 'keydown':         return false;
     case 'keyup':           return false;
     case 'scroll':          return false;
+    case 'resize':          return true;  // Layout change
+    case 'pointerdown':     return false;
     case 'pointermove':     return false;
+    case 'pointerup':       return false;
+    case 'touchstart':      return false;
     case 'touchmove':       return false;
+    case 'touchend':        return false;
     case 'focus':           return false;
     case 'blur':            return true;  // Capture after input sequence completes
     case 'paste':           return true;  // Content change
+    case 'copy':            return false; // No visual change
+    case 'cut':             return true;  // Content removal
+    case 'dragstart':       return false; // Wait for drop
     case 'drop':            return true;  // Content change
     case 'screenshot-marker': return true;
     default:                return false;
@@ -1723,22 +1876,24 @@ function shouldCaptureScreenshot(event: RecordedEvent, strategy: string): boolea
 
 ### Coverage: V8 Format and Bitmap Conversion
 
-**V8 coverage raw format** (from CDP `Profiler.takePreciseCoverage`):
+**Playwright coverage format** (from `page.coverage.stopJSCoverage()`):
+
+Playwright's high-level API returns `JSCoverageEntry[]` directly — NOT the raw CDP `{ result: [...] }` wrapper. Each entry has `url`, `scriptId`, `source` (full script text), and `functions`.
 
 ```typescript
-interface V8CoverageResult {
-  result: Array<{
-    scriptId: string;
-    url: string;
-    functions: Array<{
-      functionName: string;
-      ranges: Array<{
-        startOffset: number;  // Byte offset in source
-        endOffset: number;
-        count: number;        // Execution count
-      }>;
-      isBlockCoverage: boolean;
+// Playwright's return type (NOT the raw CDP format)
+interface JSCoverageEntry {
+  url: string;
+  scriptId: string;
+  source?: string;              // Full script source text (when available)
+  functions: Array<{
+    functionName: string;
+    ranges: Array<{
+      startOffset: number;      // Byte offset in source
+      endOffset: number;
+      count: number;            // Execution count
     }>;
+    isBlockCoverage: boolean;
   }>;
 }
 ```
@@ -1755,10 +1910,10 @@ interface CoverageBitmap {
   branchIndex: BranchIndex;      // Maps branch ID → (scriptUrl, startOffset, endOffset)
 }
 
-function v8ToBitmap(coverage: V8CoverageResult, appOrigin: string): CoverageBitmap {
+function v8ToBitmap(coverage: JSCoverageEntry[], appOrigin: string): CoverageBitmap {
   const branches: Array<{ scriptUrl: string; start: number; end: number; covered: boolean }> = [];
 
-  for (const script of coverage.result) {
+  for (const script of coverage) {
     // Filter: only app scripts, not third-party/CDN
     if (!script.url.startsWith(appOrigin)) continue;
 
@@ -2562,6 +2717,7 @@ Single file (`proof-of-concept.ts`, ~300 lines) that:
 |------|----------|-----------|
 | **No Math.random/crypto seeding** | P0 | `addInitScript()` seeded PRNG. Table-stakes. Validated in Phase 0 PoC. |
 | **Clock API edge cases (post-#31924 fix)** | P0 | Full `clock.install()` on >= 1.48. Fix landed but is "best-effort". Phase 0 PoC validates. Custom `addInitScript` patches for `document.timeline.currentTime` (#38951) and `MessageChannel` timing (React 18+ scheduler). Fallback: Date-only mock via `addInitScript()` if edge cases hit. |
+| **Clock install/pauseAt race (#33926)** | P0 | Between `clock.install({ time: T })` and `clock.pauseAt(T)`, the clock runs. If both use the same time, `pauseAt` can fail with "Cannot fast-forward to the past." Fix: install 1s before target time. Already applied in orchestrator code. |
 | **`--deterministic-mode` flag availability** | P0 | Meta-flag sets 6 compositor/animation flags. Verify presence in target Playwright Chromium version during Phase 0 PoC. If missing, set component flags individually. |
 | **Baseline blob availability (team sharing)** | P1 | `baselines.json` manifest is git-tracked but actual PNGs are in local blob store (gitignored). Teams need `eyespy pull-baselines` before first CI run. Document onboarding. Remote storage (S3/R2) is pluggable. |
 | **catch-all route causes flakiness (#22338)** | P0 | Targeted per-origin routes, not `**/*`. |
@@ -2635,7 +2791,7 @@ Two PRNG variants are used for different contexts:
 
 **Phase 1a:**
 2. **Unit tests**: Selector generation, event serialization, network route matching, PRNG seeding, DOM settle detection, pixelmatch integration, HTML report generation
-3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt), URL normalization for FIFO matching (trailing slashes, default ports, query param ordering)
+3. **Integration tests**: Replay engine against known pages with recorded network, auto-healing cascade against intentionally broken selectors, navigation timeout recovery, smart retry with fresh contexts (verify FIFO queues rebuilt correctly on each attempt), URL normalization for FIFO matching (trailing slashes, default ports, query param ordering), **timestamp convention** (verify all recorders produce relative-offset timestamps, NOT epoch ms), **URL remapping** (verify navigate events use remapped URLs when `--url` differs from recorded origin)
 3b. **Playwright recorder tests**: Record a 10-action sequence on TodoMVC via page-level event capture, verify all events captured with correct selectors (including events inside open Shadow DOM), verify network bodies stored in blob store, verify round-trip (record → save → load → replay produces matching screenshots), verify recording overlay is excluded from captures
 4. **E2E test**: Record session on TodoMVC → replay → diff → approve baselines → change CSS → replay → detect diff → approve new baselines
 5. **Determinism regression**: 10-run identical screenshot assertion runs in CI on every commit

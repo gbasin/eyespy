@@ -189,9 +189,10 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins **any request** (fetch, xhr, document, image, font, etc.) can reach. Enforced by the Layer 1 global route. Non-allowed origins aborted with `route.abort('blockedbyclient')`.
   - **Playwright-recorded sessions**: The recorder auto-discovers all origins observed during recording and persists them in `session.observedOrigins[]`. At replay time, the effective allowlist is: `[targetUrl origin]` + `originMap` values + `session.observedOrigins` + explicit `replay.allowedOrigins`. This handles CDN fonts/scripts/images automatically.
   - **SDK-recorded sessions**: The SDK only captures fetch/XHR, not subresource loads (images, fonts, scripts). Allowlist defaults to `[targetUrl origin]` + `originMap` values + explicit `replay.allowedOrigins`. Teams with CDN-heavy apps must manually add CDN origins to `replay.allowedOrigins`.
-- **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
+- **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyFingerprint`), fall back to URL-only FIFO. Body fingerprint is a truncated SHA-256 of the request body content (from BodyRef inline data or blob). This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
 - **WebSocket/SSE (Phase 1b)**: WS mocking via `page.routeWebSocket()` (Playwright 1.48+), SSE mocking via `addInitScript()` EventSource replacement. **Phase 1a behavior**: WS and SSE connections are blocked (`route.abort()` for WS upgrade requests, EventSource constructor replaced with no-op) and logged as `W_WS_BLOCKED` / `W_SSE_BLOCKED`. This prevents nondeterminism from unmocked real-time connections.
-- **CORS preflights**: If OPTIONS requests are intercepted by Playwright, auto-fulfill with `204` and dynamic `Access-Control-Allow-*` headers based on the request. If the Playwright version does not surface preflights, fail fast with `E_CORS_PREFLIGHT_UNSUPPORTED` when a preflight-dependent request fails in mock mode, and recommend switching that origin to live mode.
+- **Per-origin policy overrides**: Config `replay.originPolicies` allows per-origin control: `{ "https://api.example.com": "mock", "https://cdn.example.com": "live", "https://untrusted.example.com": "blocked" }`. When set, overrides the global `mode` for that origin. This enables mixed mock/live configurations — e.g., mock API calls while passing CDN through live, or explicitly blocking untrusted origins. Origins not in the map use the global `replay.mode`.
+- **CORS preflights**: If OPTIONS requests are intercepted by Playwright, auto-fulfill with `204` and dynamic `Access-Control-Allow-*` headers based on the request. If the Playwright version does not surface preflights, fail fast with `E_CORS_PREFLIGHT_UNSUPPORTED` when a preflight-dependent request fails in mock mode, and recommend switching that origin to live mode via `originPolicies`.
 - Never use `waitForLoadState('networkidle')` — hangs on persistent connections.
 - Use `browserContext.route()` (survives full-page navigations) not `page.route()`.
 
@@ -211,9 +212,9 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 **Phase 1b**: Full cascade + healing overlay (don't mutate recordings), confidence scoring, interaction dependency graph for cascade-skipping, explicit "promote healing" action, auto-promotion policy (>= 0.90 confidence across 3 consecutive runs).
 
 **Network mock miss handling**: When a fetch/XHR request during replay doesn't match any recorded response, behavior depends on `replay.unmatchedFetchXhrPolicy`:
-- `"error"` (recommended for CI): abort the request, mark session as `error` (exit code 2). Strict — any unrecorded API call is treated as a test failure.
-- `"warn"` (default): abort the request (`route.abort('connectionrefused')`), continue replaying. Session can still pass/diff. All misses reported in `summary.json` as `W_ROUTE_MISS_MOCK`.
-- `"passThrough"`: allow the request to hit the real network (subject to egress allowlist), log warning. Useful during migration from live to mock mode.
+- `"error"` (recommended for CI): abort the request, emit `E_ROUTE_MISS_MOCK`, mark session as `error` (exit code 2). Strict — any unrecorded API call is treated as a test failure.
+- `"warn"` (default): abort the request (`route.abort('connectionrefused')`), emit `W_ROUTE_MISS_MOCK`, continue replaying. Session can still pass/diff.
+- `"passThrough"`: allow the request to hit the real network (subject to egress allowlist), emit `W_ROUTE_MISS_PASSTHROUGH`. Useful during migration from live to mock mode.
 - In live mode (regardless of policy): pass through to real backend.
 - After replay: report all mock misses in the run summary
 - **Fuzzy URL matching** (Phase 1b): Ignore configurable query params (e.g., `_t`, `timestamp`, `nonce`) when matching FIFO queues. Match on path pattern when exact URL fails.
@@ -473,6 +474,7 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "localDiffThreshold": 0.02,
     "originMap": {},
     "allowedOrigins": [],
+    "originPolicies": {},
     "allowLiveExternalEgress": false,
     "missingBaselinePolicy": "warn",
     "rendererMismatchPolicy": "warn",
@@ -531,7 +533,7 @@ Local HTTP server for ingesting SDK recordings. **Not a production service** —
 
 `POST /v1/sessions/{sessionId}/events` — Ingest event batch (at-least-once delivery)
 - Headers: `Content-Type: application/json`, optional `Content-Encoding: gzip`, **`Idempotency-Key: <uuid>` (required)** — receiver deduplicates by storing last 100 keys per session for 24h. Duplicate key → return same 202 without re-appending.
-- Request: `{ "events": [RecordedEvent...], "sequence": { "start": N, "end": M } }` — events within a batch MUST be non-decreasing by `t_ms`; receiver rejects otherwise (`400 E_EVENTS_OUT_OF_ORDER`). Gaps in sequence between batches are allowed; `finish` validates overall monotonicity.
+- Request: `{ "events": [RecordedEvent...], "sequence": { "start": N, "end": M } }` — within a batch: `seq` must be contiguous (`events[i].seq = sequence.start + i`) and `t_ms` non-decreasing; receiver rejects otherwise (`400 E_EVENTS_OUT_OF_ORDER`). Cross-batch `seq` gaps are allowed during ingestion; `finish` validates global contiguity (`0..maxSeq` with no gaps) and rejects with `409 E_SESSION_INCOMPLETE` if gaps remain.
 - Response 202: `{ "accepted": true, "eventCount": N }`
 - Receiver: validates schema, appends to `.eyespy/sessions/.incoming/{sessionId}/`, extracts large bodies to blob store
 - Errors: `400 E_SCHEMA`, `400 E_EVENTS_OUT_OF_ORDER`, `413 E_BATCH_TOO_LARGE` (> 5MB), `429 E_RATE_LIMIT`
@@ -539,7 +541,7 @@ Local HTTP server for ingesting SDK recordings. **Not a production service** —
 `POST /v1/sessions/{sessionId}/finish` — Finalize session
 - Request: `{ "endedAt": "ISO-8601" }`
 - Response 200: `{ "sessionId": "uuid", "path": ".eyespy/sessions/{id}.json" }`
-- Errors: `404 E_SESSION_NOT_FOUND`, `409 E_SESSION_NOT_OPEN`
+- Errors: `404 E_SESSION_NOT_FOUND`, `409 E_SESSION_NOT_OPEN`, `409 E_SESSION_INCOMPLETE`
 
 **Error response format** (all non-2xx):
 ```json
@@ -562,10 +564,11 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `E_SESSION_TIMEOUT` | Replay | Session replay exceeded timeout (default 120s) |
 | `E_PW_CRASH` | Replay | Browser/page crashed during replay |
 | `E_DIMENSION_MISMATCH` | Diff | Screenshot dimensions differ from baseline |
-| `E_ROUTE_MISS` | Replay | Unrecorded fetch/XHR in mock mode; severity depends on `replay.unmatchedFetchXhrPolicy` |
+| `E_ROUTE_MISS_MOCK` | Replay | Unrecorded fetch/XHR in mock mode when `unmatchedFetchXhrPolicy=error` |
 | `E_SESSION_UNREPLAYABLE` | Replay | >30% of interactions failed auto-healing |
 | `E_SCHEMA` | Receiver | Invalid request body |
-| `E_EVENTS_OUT_OF_ORDER` | Receiver | Event batch has non-contiguous `seq` values or `seq` not sorted ascending |
+| `E_EVENTS_OUT_OF_ORDER` | Receiver | Event batch has non-contiguous `seq` values within batch or `t_ms` not non-decreasing |
+| `E_SESSION_INCOMPLETE` | Receiver | `/finish` validation: merged event stream has `seq` gaps (not contiguous `0..maxSeq`) |
 | `E_SESSION_EXISTS` | Receiver | Session ID already exists |
 | `E_SESSION_NOT_FOUND` | Receiver | Session ID not found |
 | `E_BATCH_TOO_LARGE` | Receiver | Event batch exceeds 5MB |
@@ -579,6 +582,8 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 |------|---------|-------------|
 | `W_BODY_TRUNCATED` | Replay | Response body was truncated during recording; FIFO matching may degrade |
 | `W_HEALING_USED` | Replay | Selector healed via fallback strategy (includes confidence) |
+| `W_ROUTE_MISS_MOCK` | Replay | Unrecorded fetch/XHR in mock mode when `unmatchedFetchXhrPolicy=warn` |
+| `W_ROUTE_MISS_PASSTHROUGH` | Replay | Unrecorded fetch/XHR passed through when `unmatchedFetchXhrPolicy=passThrough` |
 | `W_ROUTE_MISS_LIVE` | Replay | Unrecorded request passed through in live mode |
 | `W_BASELINE_MISSING` | Diff | No baseline exists for this screenshot (treated as "new") |
 | `W_RENDERER_MISMATCH` | Diff | Playwright version differs from baseline renderer |
@@ -1043,13 +1048,14 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 
     try {
       const body = await response.body();
-      const bodyHash = await blobStore.put(body);
+      const digest = await blobStore.put(body);
       events.push({
         type: 'network', t_ms: relTs(),
         event: {
           type: 'response', requestId, url: response.url(),
           method: response.request().method(), status: response.status(),
-          headers: sanitizeHeaders(response.headers()), bodyHash,
+          headers: sanitizeHeaders(response.headers()),
+          body: { kind: 'blob', digest: `sha256:${digest}`, truncated: false, byteLength: body.length, contentType: response.headers()['content-type'] },
           durationMs: Date.now() - startTime,
         },
       });
@@ -1086,9 +1092,10 @@ interface RecordedSession {
   captureMethod: 'playwright' | 'sdk';  // Which recorder produced this session
   observedOrigins?: string[];    // All origins seen during recording (Playwright recorder auto-populates; SDK omits)
   events: RecordedEvent[];       // Sorted by seq ascending, t_ms non-decreasing (ms offset from session start, NOT epoch)
-  // Network body storage: Response bodies are always referenced by `bodyHash` on
-  // individual response NetworkEvents, pointing to SHA-256 keys in .eyespy/blobs/.
-  // The SDK receiver converts inline bodies to blob hashes on ingest.
+  // Network body storage: Response/request bodies use the `BodyRef` discriminated union
+  // on individual NetworkEvents. Inline bodies are stored directly; large bodies are
+  // stored in .eyespy/blobs/ and referenced by `sha256:` digest.
+  // The SDK receiver converts inline bodies to blob references on ingest when they exceed threshold.
   // No separate networkBodies map — body references live on the events themselves.
 }
 
@@ -1162,8 +1169,8 @@ type NetworkEvent =
   | { type: 'ws-close'; wsId: string; url: string; code: number; t_ms: number }
   | { type: 'sse-open'; sseId: string; url: string; t_ms: number }
   | { type: 'sse-event'; sseId: string; url: string; eventType: string; data: string; lastEventId?: string; t_ms: number };
-// Note: Response bodies stored in blob store, referenced by bodyHash.
-// The bodyHash maps to a SHA-256 key in .eyespy/blobs/.
+// Note: Response bodies use BodyRef — inline for small bodies, blob digest for large.
+// Blob digests use the canonical format `sha256:<hex64>` and map to .eyespy/blobs/.
 
 // --- Replay types ---
 
@@ -1198,8 +1205,8 @@ interface BranchIndex {
 
 **Session validation** (on load, before replay):
 1. Check `formatVersion` — reject with clear error if mismatch (e.g., "Session format v2 requires @eyespy/cli >= 0.3.0")
-2. Verify events are chronologically sorted (monotonic `timestamp`)
-3. Verify all `bodyHash` references exist in blob store — collect missing hashes, warn (not error) with count
+2. Verify `seq` is strictly increasing and `t_ms` is non-decreasing
+3. Verify all `BodyRef(kind='blob')` digests exist in blob store — collect missing digests, warn (not error) with count
 4. Verify session has at least one interaction event (not just network events)
 5. Verify `captureMethod` field exists (old sessions without it: assume `'playwright'`)
 6. Schema validation via TypeScript type guards at runtime (not JSON Schema — too heavy for CLI)
@@ -1315,22 +1322,22 @@ function findResponse(events: RecordedEvent[], requestId: string): NetworkEvent 
 //
 // Trade-off: This means a request body MUST be recorded to get correct matching. The
 // SDK and Playwright recorder both capture request bodies — but if a body is too large
-// and was truncated, the hash won't match. Truncation threshold (MAX_BODY_SIZE) must be
-// large enough to capture GraphQL queries (typically < 10KB) but small enough to avoid
-// storing multi-MB file uploads. Default: 64KB.
+// and was truncated, the fingerprint won't match. Per-capture-method defaults apply:
+// SDK default 256KB, Playwright recorder default 1MB (see `maxBodyBytes` in Decisions).
 
 // Uses createHash from 'crypto' (already imported for blob store)
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
 
-function requestBodyFingerprint(body: string | undefined): string {
-  if (!body) return '';
+function requestBodyFingerprint(body: BodyRef): string {
+  if (body.kind === 'none') return '';
   // Truncated SHA-256 (first 12 hex chars) — enough to distinguish different requests,
   // short enough to not bloat queue key maps in memory.
-  return createHash('sha256').update(body).digest('hex').substring(0, 12);
+  if (body.kind === 'blob') return body.digest.replace('sha256:', '').substring(0, 12);
+  return createHash('sha256').update(body.data).digest('hex').substring(0, 12);
 }
 
 function buildNetworkQueues(session: RecordedSession): {
-  bodyQueues: Map<string, NetworkEvent[]>;   // "METHOD:url:bodyHash" → FIFO (for POST/PUT/PATCH)
+  bodyQueues: Map<string, NetworkEvent[]>;   // "METHOD:url:bodyFingerprint" → FIFO (for POST/PUT/PATCH)
   urlQueues: Map<string, NetworkEvent[]>;    // "METHOD:url" → FIFO (fallback, and GET/DELETE/etc.)
 } {
   const bodyQueues = new Map<string, NetworkEvent[]>();
@@ -1348,7 +1355,7 @@ function buildNetworkQueues(session: RecordedSession): {
     urlQueues.get(urlKey)!.push(response);
 
     // For body methods, also add to body-fingerprinted queue
-    if (BODY_METHODS.has(event.event.method) && event.event.body) {
+    if (BODY_METHODS.has(event.event.method) && event.event.body.kind !== 'none') {
       const bodyKey = `${urlKey}:${requestBodyFingerprint(event.event.body)}`;
       if (!bodyQueues.has(bodyKey)) bodyQueues.set(bodyKey, []);
       bodyQueues.get(bodyKey)!.push(response);
@@ -1367,13 +1374,18 @@ async function registerRoutes(
   mode: 'mock' | 'live',
   allowedOrigins: Set<string>,
   allowLiveExternalEgress: boolean,
+  originPolicies?: Record<string, 'mock' | 'live' | 'blocked'>,  // Per-origin overrides
 ) {
   // --- Layer 1: Global egress enforcement ---
   // This route intercepts ALL requests but NEVER fulfills responses.
   // It only allows or blocks based on origin, then falls back to Layer 2 or the network.
   await context.route('**/*', async (route) => {
     const requestOrigin = new URL(route.request().url()).origin;
-    if (allowedOrigins.has(requestOrigin) || allowLiveExternalEgress) {
+    // Per-origin policy override takes precedence
+    const originPolicy = originPolicies?.[requestOrigin];
+    if (originPolicy === 'blocked') {
+      await route.abort('blockedbyclient');
+    } else if (allowedOrigins.has(requestOrigin) || allowLiveExternalEgress) {
       await route.fallback(); // Pass to Layer 2 (if registered) or network
     } else {
       await route.abort('blockedbyclient'); // SSRF: non-allowed origin
@@ -1428,7 +1440,9 @@ async function registerRoutes(
       }
 
       if (matched) {
-        const body = matched.bodyHash ? await blobStore.get(matched.bodyHash) : undefined;
+        const body = matched.body.kind === 'blob' ? await blobStore.get(matched.body.digest.replace('sha256:', ''))
+                   : matched.body.kind === 'inline' ? Buffer.from(matched.body.data, matched.body.encoding === 'base64' ? 'base64' : 'utf8')
+                   : undefined;
         await route.fulfill({ status: matched.status, headers: matched.headers, body });
       } else {
         await route.abort('connectionrefused'); // Unrecorded fetch/xhr in mock mode
@@ -1671,7 +1685,7 @@ async function replaySession(
   browser: Browser,
   session: RecordedSession,
   seed: string,
-  options: { collectCoverage: boolean; mode: 'mock' | 'live'; screenshotStrategy: string; targetUrl?: string; viewport?: { width: number; height: number } },
+  options: { collectCoverage: boolean; mode: 'mock' | 'live'; screenshotStrategy: string; targetUrl?: string; viewport?: { width: number; height: number }; allowLiveExternalEgress?: boolean; allowedOrigins?: string[]; originPolicies?: Record<string, 'mock' | 'live' | 'blocked'> },
 ): Promise<ReplayResult> {
   // 1. Fresh BrowserContext (clean state, no bleed between sessions/retries)
   const context = await browser.newContext({
@@ -1693,7 +1707,8 @@ async function replaySession(
   //    (originMap) translates recorded frontend origin → replay target origin so that
   //    same-origin API requests match correctly.
   const networkQueues = buildNetworkQueues(session);
-  await registerRoutes(context, networkQueues, options.mode);
+  const effectiveAllowedOrigins = computeAllowedOrigins(session, options);
+  await registerRoutes(context, networkQueues, options.mode, effectiveAllowedOrigins, options.allowLiveExternalEgress ?? false);
 
   // 4. Create page, install clock BEFORE any navigation
   const page = await context.newPage();
@@ -1737,8 +1752,10 @@ async function replaySession(
 
   await waitForDomSettle(page);
   // Screenshot key uses event seq: nav@e{seq}, cap@e{seq}, final
-  // Initial navigation marker is always seq=0
-  screenshots.set('nav@e0', await captureStableScreenshot(page));
+  // Derive initial screenshot key from first navigate event's seq, or 'initial' if none exists
+  const firstNav = session.events.find(e => e.type === 'navigate');
+  const initialKey = firstNav ? `nav@e${firstNav.seq}` : 'initial';
+  screenshots.set(initialKey, await captureStableScreenshot(page));
 
   // 8. Replay interactions in chronological order (sorted by seq)
   const interactions = session.events
@@ -1773,14 +1790,17 @@ async function replaySession(
     await waitForDomSettle(page);
 
     // Tiered screenshot capture — key derived from event seq
+    // Clock lifecycle: pause → screenshot → resume (normative invariant)
     if (shouldCaptureScreenshot(event, options.screenshotStrategy)) {
       await page.clock.pauseAt(new Date(startTime.getTime() + event.t_ms));
       const keyPrefix = event.type === 'navigate' ? 'nav' : 'cap';
       screenshots.set(`${keyPrefix}@e${event.seq}`, await captureStableScreenshot(page));
+      await page.clock.resume(); // Resume before next interaction — prevents timer freeze during settle
     }
   }
 
   // 9. Final screenshot (always) — key is always 'final'
+  // Clock lifecycle: pause → screenshot (no resume needed — session ends)
   await page.clock.pauseAt(new Date(startTime.getTime() + lastEventTimestamp));
   screenshots.set('final', await captureStableScreenshot(page));
 
@@ -3118,6 +3138,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 - Audit logging for baseline approvals
 - Branch-aware baselines (per-branch baseline sets)
 - Docker Compose deployment
+- **Minimum Prometheus metrics** (required at Phase 2 GA, not deferred): `eyespy_replay_session_duration_ms` histogram, `eyespy_replay_flake_retry_count` counter, `eyespy_route_miss_total{policy}` counter, `eyespy_diff_pixels_ratio` histogram, `eyespy_receiver_requests_total{code}` counter, `eyespy_blob_integrity_failures_total` counter, `eyespy_queue_lag_seconds` gauge. Exposed on `/metrics` endpoint (Prometheus text format).
 
 ### Phase 3: Scale + Polish
 
@@ -3125,7 +3146,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 - Horizontal worker scaling + CI job sharding for > 100 sessions
 - Coverage treemap in dashboard
 - Session playback viewer
-- Prometheus metrics
+- Advanced Prometheus dashboards + Grafana templates
 - OpenAPI spec
 - Incremental blob GC (reference counting instead of full scan)
 - Advanced: BeginFrame (Linux/Windows), Web Worker time mocking, canvas stabilization

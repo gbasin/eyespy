@@ -178,8 +178,10 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
 **Network mocking**: **ResourceType-based routing** — mock only `fetch` and `xhr` resource types (the data layer), allow `document`, `script`, `stylesheet`, `image`, `font`, `media`, `manifest` through to the real server (the rendering layer). This means same-origin API calls (`/api/users`) get mocked while the app's HTML/JS/CSS loads normally from the target URL. Use **targeted route patterns** per recorded origin (e.g., `page.route('**/api.stripe.com/**')`) instead of catch-all `**/*`. Catch-all introduces flakiness (#22338). Route handler checks `request.resourceType()` before matching — if not `fetch`/`xhr`, call `route.continue()`.
-- **Mock mode**: Mock recorded fetch/XHR, abort unrecorded fetch/XHR (`route.abort('connectionrefused')`), allow all other resource types through.
+- **Mock mode**: Mock recorded fetch/XHR, abort unrecorded fetch/XHR (`route.abort('connectionrefused')`), allow other resource types through only to **allowed origins** (see below).
 - **Live mode**: No fetch/XHR mocking — all requests pass through to real backend. Optional WS/SSE replay.
+- **Origin remapping** (handles recording at `localhost:3000`, replaying at `ci:3000`): Config `replay.originMap` maps recorded origins to replay origins. Applied uniformly to: (a) route interception patterns, (b) FIFO queue keys, (c) session event URL matching. **Auto-infer**: if `originMap` is empty, the replay engine computes `{ recordedSessionOrigin → targetUrl origin }` automatically. For multi-origin apps (e.g., separate API server), provide explicit mappings: `{ "http://localhost:4000": "http://ci-api:4000" }`. All URL normalization passes through `remapUrl()` which applies the origin map before any matching.
+- **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins non-fetch resources (document, script, image, font) can load from. Default: `[targetUrl origin]` + all origins in `originMap` values. Requests to non-allowed origins for any resource type are aborted with `route.abort('blockedbyclient')`. Prevents malicious PRs from exfiltrating data via modified asset URLs in CI environments.
 - **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
 - **WebSocket mocking**: `page.routeWebSocket()` (Playwright 1.48+). Replay recorded frames in order with timing.
 - **SSE mocking**: Replace `EventSource` via `addInitScript()` with a mock that serves recorded events.
@@ -236,7 +238,7 @@ Example: If events are `[navigate(0), click(1), input(2), click(3), navigate(4)]
 
 If a capture point fails (page crash, timeout), the key still exists in the run output as `{ status: "error", error: "..." }` — later keys do not shift.
 
-**Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times to confirm. Majority vote (2-of-3 must show diff for it to count). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.** Coverage collection is OFF during retry attempts — we already have the coverage bitmap from the first replay. Retry attempts exist solely to confirm/reject visual diffs.
+**Smart retry**: Replay once. Determine diff candidates using the **same pixel threshold** as final pass/fail (not hash comparison alone — a hash can differ while the pixel diff is under threshold due to compression/metadata variance). For each candidate, replay 2 more times to confirm. Majority vote (2-of-3 must exceed pixel threshold for it to count as a confirmed diff). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.** Coverage collection is OFF during retry attempts — we already have the coverage bitmap from the first replay. Retry attempts exist solely to confirm/reject visual diffs.
 
 **Fresh context per retry** (critical implementation detail): FIFO network queues are consumed by `.shift()` during replay — after the first replay, all queues are empty. Each retry attempt MUST:
 1. Create a fresh `BrowserContext` (no shared state from previous attempt)
@@ -291,7 +293,7 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 - Region masking: rectangles or CSS selectors for dynamic content (timestamps, ads, avatars) **(Phase 1b)**
 - Content-hash short-circuit: SHA-256 hash screenshot before diffing. If hash matches baseline, skip pixelmatch entirely.
 - Three-panel output: expected | actual | diff (red pixels)
-- **HTML report**: Standalone HTML file with base64-inlined images for <= 30 screenshots. **Folder-based report** (images as separate files + index.html) for > 30 screenshots. Four viewer modes: side-by-side, slider (CSS `clip-path`), blend (opacity crossfade), toggle (click to switch).
+- **HTML report**: Standalone HTML file with base64-inlined images for <= 30 screenshots. **Folder-based report** (images as separate files + index.html) for > 30 screenshots. Four viewer modes: side-by-side, slider (CSS `clip-path`), blend (opacity crossfade), toggle (click to switch). **All session-derived strings (URLs, session IDs, screenshot keys, error messages) MUST be HTML-escaped before rendering** — report templates must never inline unsanitized content to prevent XSS when reports are opened in browsers.
 
 ### 5. CLI (`@eyespy/cli`)
 
@@ -390,15 +392,18 @@ Used by CI integrations (PR comments, Slack notifications, dashboards) without p
 
 **Key design**: Only `config.json`, `baselines.json`, and `suites/` are git-tracked. All binary artifacts (PNGs, network bodies) live in `blobs/` (gitignored). This prevents git repo bloat — the manifest file changes by a few bytes per approval, not megabytes of PNGs.
 
+**Canonical digest format**: `sha256:<lowercase-hex-64>` in all manifests, APIs, and summary.json. BlobStore filesystem paths use raw hex only (no `sha256:` prefix): `.eyespy/blobs/<hex[0..1]>/<hex[2..3]>/<hex>`. `BlobStore.put()` returns raw hex; callers add `sha256:` prefix when writing to manifests. On read, strip `sha256:` prefix to derive filesystem path. This separation keeps paths filesystem-safe while manifests are future-proof for algorithm changes.
+
 **Baseline manifest format**:
 ```json
 {
   "version": 1,
+  "renderer": { "playwrightVersion": "1.50.0", "dockerImage": "mcr.microsoft.com/playwright:v1.50.0-noble" },
   "baselines": {
     "session-abc123": {
-      "nav@e0": { "hash": "sha256:e3b0c44...", "width": 1280, "height": 720 },
-      "cap@e5": { "hash": "sha256:a1f2b3c...", "width": 1280, "height": 720 },
-      "final": { "hash": "sha256:d4e5f6a...", "width": 1280, "height": 720 }
+      "nav@e0": { "digest": "sha256:e3b0c44298fc1c14...", "width": 1280, "height": 720 },
+      "cap@e5": { "digest": "sha256:a1f2b3c4d5e6f7a8...", "width": 1280, "height": 720 },
+      "final": { "digest": "sha256:d4e5f6a7b8c9d0e1...", "width": 1280, "height": 720 }
     }
   }
 }
@@ -442,7 +447,9 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "mode": "mock",
     "viewport": { "width": 1280, "height": 720 },
     "seed": "default",
-    "localDiffThreshold": 0.02
+    "localDiffThreshold": 0.02,
+    "originMap": {},
+    "allowedOrigins": []
   },
   "storage": {
     "backend": "local",
@@ -647,7 +654,7 @@ window.fetch = function(input: RequestInfo | URL, init?: RequestInit): Promise<R
     type: 'request', requestId, url, method,
     headers: sanitizeHeaders(init?.headers),
     body: shouldCaptureBody(url) ? truncate(init?.body, MAX_BODY_SIZE) : undefined,
-    timestamp: Date.now(),
+    t_ms: sdkTs(),
   });
 
   return _originalFetch(input, init).then(
@@ -709,17 +716,17 @@ window.WebSocket = new Proxy(_OriginalWebSocket, {
     const ws = new target(url, protocols);
     const wsId = nextWsId();
 
-    recordNetworkEvent({ type: 'ws-open', wsId, url, timestamp: Date.now() });
+    recordNetworkEvent({ type: 'ws-open', wsId, url, t_ms: sdkTs() });
 
     ws.addEventListener('message', (e: MessageEvent) => {
       recordNetworkEvent({
         type: 'ws-receive', wsId, url,
         data: typeof e.data === 'string' ? truncate(e.data, MAX_BODY_SIZE) : '<binary>',
-        timestamp: Date.now(),
+        t_ms: sdkTs(),
       });
     });
     ws.addEventListener('close', (e: CloseEvent) => {
-      recordNetworkEvent({ type: 'ws-close', wsId, url, code: e.code, timestamp: Date.now() });
+      recordNetworkEvent({ type: 'ws-close', wsId, url, code: e.code, t_ms: sdkTs() });
     });
 
     const _originalSend = ws.send.bind(ws);
@@ -727,7 +734,7 @@ window.WebSocket = new Proxy(_OriginalWebSocket, {
       recordNetworkEvent({
         type: 'ws-send', wsId, url,
         data: typeof data === 'string' ? truncate(data, MAX_BODY_SIZE) : '<binary>',
-        timestamp: Date.now(),
+        t_ms: sdkTs(),
       });
       return _originalSend(data);
     };
@@ -746,7 +753,7 @@ window.EventSource = new Proxy(_OriginalEventSource, {
     const es = new target(url, init);
     const sseId = nextSseId();
 
-    recordNetworkEvent({ type: 'sse-open', sseId, url, timestamp: Date.now() });
+    recordNetworkEvent({ type: 'sse-open', sseId, url, t_ms: sdkTs() });
 
     const _originalAddEventListener = es.addEventListener.bind(es);
     es.addEventListener = function(type: string, listener: any, options?: any) {
@@ -754,7 +761,7 @@ window.EventSource = new Proxy(_OriginalEventSource, {
         recordNetworkEvent({
           type: 'sse-event', sseId, url, eventType: type,
           data: event.data, lastEventId: event.lastEventId,
-          timestamp: Date.now(),
+          t_ms: sdkTs(),
         });
         listener(event);
       };
@@ -770,7 +777,7 @@ window.EventSource = new Proxy(_OriginalEventSource, {
         _originalAddEventListener('message', (event: MessageEvent) => {
           recordNetworkEvent({
             type: 'sse-event', sseId, url, eventType: 'message',
-            data: event.data, timestamp: Date.now(),
+            data: event.data, t_ms: sdkTs(),
           });
         });
       }
@@ -883,7 +890,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       const el = e.target as Element;
       if (!el || isRecordingOverlay(el)) return;
       (window as any).__eyespy_recordEvent({
-        type: 'click', timestamp: ts(), selector: generateSelector(el),
+        type: 'click', t_ms: ts(), selector: generateSelector(el),
         x: (e as MouseEvent).clientX, y: (e as MouseEvent).clientY,
         button: (e as MouseEvent).button,
         modifiers: { meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey },
@@ -894,7 +901,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       const el = e.target as Element;
       if (!el || isRecordingOverlay(el)) return;
       (window as any).__eyespy_recordEvent({
-        type: 'dblclick', timestamp: ts(), selector: generateSelector(el),
+        type: 'dblclick', t_ms: ts(), selector: generateSelector(el),
         x: (e as MouseEvent).clientX, y: (e as MouseEvent).clientY,
       });
     }, true);
@@ -904,14 +911,14 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       if (!el || isRecordingOverlay(el)) return;
       const value = (el as HTMLInputElement).type === 'password' ? '***' : (el as HTMLInputElement).value;
       (window as any).__eyespy_recordEvent({
-        type: 'input', timestamp: ts(), selector: generateSelector(el),
+        type: 'input', t_ms: ts(), selector: generateSelector(el),
         value, inputType: (e as InputEvent).inputType,
       });
     }, true);
 
     document.addEventListener('keydown', (e) => {
       (window as any).__eyespy_recordEvent({
-        type: 'keydown', timestamp: ts(),
+        type: 'keydown', t_ms: ts(),
         key: (e as KeyboardEvent).key, code: (e as KeyboardEvent).code,
         modifiers: { meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey },
       });
@@ -919,7 +926,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 
     document.addEventListener('keyup', (e) => {
       (window as any).__eyespy_recordEvent({
-        type: 'keyup', timestamp: ts(),
+        type: 'keyup', t_ms: ts(),
         key: (e as KeyboardEvent).key, code: (e as KeyboardEvent).code,
       });
     }, true);
@@ -931,7 +938,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       scrollTimer = setTimeout(() => {
         const el = e.target === document ? null : e.target as Element;
         (window as any).__eyespy_recordEvent({
-          type: 'scroll', timestamp: ts(),
+          type: 'scroll', t_ms: ts(),
           selector: el ? generateSelector(el) : null,
           x: el ? el.scrollLeft : window.scrollX,
           y: el ? el.scrollTop : window.scrollY,
@@ -945,18 +952,18 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
     history.pushState = function(...args: any[]) {
       _pushState(...args);
       (window as any).__eyespy_recordEvent({
-        type: 'navigate', timestamp: ts(), url: location.href, navigationType: 'push',
+        type: 'navigate', t_ms: ts(), url: location.href, navigationType: 'push',
       });
     };
     history.replaceState = function(...args: any[]) {
       _replaceState(...args);
       (window as any).__eyespy_recordEvent({
-        type: 'navigate', timestamp: ts(), url: location.href, navigationType: 'replace',
+        type: 'navigate', t_ms: ts(), url: location.href, navigationType: 'replace',
       });
     };
     window.addEventListener('popstate', () => {
       (window as any).__eyespy_recordEvent({
-        type: 'navigate', timestamp: ts(), url: location.href, navigationType: 'popstate',
+        type: 'navigate', t_ms: ts(), url: location.href, navigationType: 'popstate',
       });
     });
   });
@@ -980,10 +987,10 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
     // distinguished during replay. `request.postData()` returns null for GET/HEAD/DELETE.
     const body = request.postData() ?? undefined;
     events.push({
-      type: 'network', timestamp: relTs(),
+      type: 'network', t_ms: relTs(),
       event: {
         type: 'request', requestId, url: request.url(), method: request.method(),
-        headers: sanitizeHeaders(request.headers()), body, timestamp: relTs(),
+        headers: sanitizeHeaders(request.headers()), body, t_ms: relTs(),
       },
     });
   });
@@ -998,7 +1005,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
       const body = await response.body();
       const bodyHash = await blobStore.put(body);
       events.push({
-        type: 'network', timestamp: relTs(),
+        type: 'network', t_ms: relTs(),
         event: {
           type: 'response', requestId, url: response.url(),
           method: response.request().method(), status: response.status(),
@@ -1025,7 +1032,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 
 **Session format** — Flat event array with **relative timestamps** (milliseconds from session start). Network bodies stored separately in blobs.
 
-**Timestamp convention**: All `timestamp` fields in `RecordedEvent` are **milliseconds from session start** (offset, NOT absolute epoch). Recorders compute: `timestamp = Date.now() - sessionStartTime`. This makes sessions portable (replayable regardless of when they were recorded) and makes the orchestrator's delta calculation trivial (`delta = event.timestamp - lastEventTimestamp`, starting from 0). The orchestrator advances the mocked clock by `delta` ms between events, and pauses at `new Date(startTime.getTime() + event.timestamp)` for screenshots — both formulas are correct because `event.timestamp` is an offset.
+**Timestamp convention**: All `timestamp` fields in `RecordedEvent` are **milliseconds from session start** (offset, NOT absolute epoch). Recorders compute: `timestamp = Date.now() - sessionStartTime`. This makes sessions portable (replayable regardless of when they were recorded) and makes the orchestrator's delta calculation trivial (`delta = event.t_ms - lastEventTimestamp`, starting from 0). The orchestrator advances the mocked clock by `delta` ms between events, and pauses at `new Date(startTime.getTime() + event.t_ms)` for screenshots — both formulas are correct because `event.t_ms` is an offset.
 
 ```typescript
 interface RecordedSession {
@@ -1037,37 +1044,39 @@ interface RecordedSession {
   viewport: { width: number; height: number };
   userAgent: string;
   captureMethod: 'playwright' | 'sdk';  // Which recorder produced this session
-  events: RecordedEvent[];       // Chronological, monotonic timestamps (ms from session start)
+  events: RecordedEvent[];       // Chronological, monotonic t_ms values (ms offset from session start, NOT epoch)
   // Network body storage: Response bodies are always referenced by `bodyHash` on
   // individual response NetworkEvents, pointing to SHA-256 keys in .eyespy/blobs/.
   // The SDK receiver converts inline bodies to blob hashes on ingest.
   // No separate networkBodies map — body references live on the events themselves.
 }
 
+// All t_ms values are milliseconds from session start (offset, NOT epoch).
+// Epoch timestamps MUST NOT appear in stored session events.
 type RecordedEvent =
-  | { type: 'click'; timestamp: number; selector: SelectorBundle; x: number; y: number; button: number; modifiers: Modifiers }
-  | { type: 'dblclick'; timestamp: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'input'; timestamp: number; selector: SelectorBundle; value: string; inputType?: string }
-  | { type: 'keydown'; timestamp: number; key: string; code: string; modifiers: Modifiers }
-  | { type: 'keyup'; timestamp: number; key: string; code: string }
-  | { type: 'scroll'; timestamp: number; selector: SelectorBundle | null; x: number; y: number }
-  | { type: 'navigate'; timestamp: number; url: string; navigationType: 'push' | 'replace' | 'popstate' }
-  | { type: 'resize'; timestamp: number; width: number; height: number }
-  | { type: 'focus'; timestamp: number; selector: SelectorBundle }
-  | { type: 'blur'; timestamp: number; selector: SelectorBundle }
-  | { type: 'pointerdown'; timestamp: number; selector: SelectorBundle; x: number; y: number; pointerId: number }
-  | { type: 'pointermove'; timestamp: number; x: number; y: number; pointerId: number }
-  | { type: 'pointerup'; timestamp: number; x: number; y: number; pointerId: number }
-  | { type: 'touchstart'; timestamp: number; selector: SelectorBundle; touches: Touch[] }
-  | { type: 'touchmove'; timestamp: number; touches: Touch[] }
-  | { type: 'touchend'; timestamp: number; touches: Touch[] }
-  | { type: 'dragstart'; timestamp: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'drop'; timestamp: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'paste'; timestamp: number; selector: SelectorBundle; text: string }
-  | { type: 'copy'; timestamp: number; selector: SelectorBundle }
-  | { type: 'cut'; timestamp: number; selector: SelectorBundle }
-  | { type: 'network'; timestamp: number; event: NetworkEvent }
-  | { type: 'screenshot-marker'; timestamp: number; label: string };
+  | { type: 'click'; t_ms: number; selector: SelectorBundle; x: number; y: number; button: number; modifiers: Modifiers }
+  | { type: 'dblclick'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { type: 'input'; t_ms: number; selector: SelectorBundle; value: string; inputType?: string }
+  | { type: 'keydown'; t_ms: number; key: string; code: string; modifiers: Modifiers }
+  | { type: 'keyup'; t_ms: number; key: string; code: string }
+  | { type: 'scroll'; t_ms: number; selector: SelectorBundle | null; x: number; y: number }
+  | { type: 'navigate'; t_ms: number; url: string; navigationType: 'push' | 'replace' | 'popstate' }
+  | { type: 'resize'; t_ms: number; width: number; height: number }
+  | { type: 'focus'; t_ms: number; selector: SelectorBundle }
+  | { type: 'blur'; t_ms: number; selector: SelectorBundle }
+  | { type: 'pointerdown'; t_ms: number; selector: SelectorBundle; x: number; y: number; pointerId: number }
+  | { type: 'pointermove'; t_ms: number; x: number; y: number; pointerId: number }
+  | { type: 'pointerup'; t_ms: number; x: number; y: number; pointerId: number }
+  | { type: 'touchstart'; t_ms: number; selector: SelectorBundle; touches: Touch[] }
+  | { type: 'touchmove'; t_ms: number; touches: Touch[] }
+  | { type: 'touchend'; t_ms: number; touches: Touch[] }
+  | { type: 'dragstart'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { type: 'drop'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { type: 'paste'; t_ms: number; selector: SelectorBundle; text: string }
+  | { type: 'copy'; t_ms: number; selector: SelectorBundle }
+  | { type: 'cut'; t_ms: number; selector: SelectorBundle }
+  | { type: 'network'; t_ms: number; event: NetworkEvent }
+  | { type: 'screenshot-marker'; t_ms: number; label: string };
 
 interface SelectorBundle {
   primary: string;               // Best selector (data-testid > id > role > css path)
@@ -1087,14 +1096,14 @@ interface Modifiers {
 }
 
 type NetworkEvent =
-  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; timestamp: number }
-  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash?: string; durationMs: number; error?: string }
-  | { type: 'ws-open'; wsId: string; url: string; timestamp: number }
-  | { type: 'ws-send'; wsId: string; url: string; data: string; timestamp: number }
-  | { type: 'ws-receive'; wsId: string; url: string; data: string; timestamp: number }
-  | { type: 'ws-close'; wsId: string; url: string; code: number; timestamp: number }
-  | { type: 'sse-open'; sseId: string; url: string; timestamp: number }
-  | { type: 'sse-event'; sseId: string; url: string; eventType: string; data: string; lastEventId?: string; timestamp: number };
+  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; bodyTruncated?: boolean; t_ms: number }
+  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash?: string; bodyTruncated?: boolean; durationMs: number; error?: string }
+  | { type: 'ws-open'; wsId: string; url: string; t_ms: number }
+  | { type: 'ws-send'; wsId: string; url: string; data: string; t_ms: number }
+  | { type: 'ws-receive'; wsId: string; url: string; data: string; t_ms: number }
+  | { type: 'ws-close'; wsId: string; url: string; code: number; t_ms: number }
+  | { type: 'sse-open'; sseId: string; url: string; t_ms: number }
+  | { type: 'sse-event'; sseId: string; url: string; eventType: string; data: string; lastEventId?: string; t_ms: number };
 // Note: Response bodies stored in blob store, referenced by bodyHash.
 // The bodyHash maps to a SHA-256 key in .eyespy/blobs/.
 
@@ -1659,13 +1668,13 @@ async function replaySession(
 
   for (const event of interactions) {
     // Advance mocked clock to this event's time
-    const delta = event.timestamp - lastEventTimestamp;
+    const delta = event.t_ms - lastEventTimestamp;
     if (delta > 0) {
       // Deliver any pending WS/SSE messages due during this time window
-      await deliverPendingMessages(page, wsHandles, lastEventTimestamp, event.timestamp);
+      await deliverPendingMessages(page, wsHandles, lastEventTimestamp, event.t_ms);
       await page.clock.runFor(delta);
     }
-    lastEventTimestamp = event.timestamp;
+    lastEventTimestamp = event.t_ms;
 
     // Dispatch the interaction
     totalInteractions++;
@@ -1686,7 +1695,7 @@ async function replaySession(
 
     // Tiered screenshot capture
     if (shouldCaptureScreenshot(event, options.screenshotStrategy)) {
-      await page.clock.pauseAt(new Date(startTime.getTime() + event.timestamp));
+      await page.clock.pauseAt(new Date(startTime.getTime() + event.t_ms));
       screenshots.set(`${pad(screenshotIndex++)}-${event.type}`, await captureStableScreenshot(page));
     }
   }
@@ -1848,7 +1857,7 @@ async function deliverPendingMessages(
 ): Promise<void> {
   // WebSocket messages (Node.js side — real timers, deliver immediately)
   for (const [url, handle] of wsHandles) {
-    while (handle.pending.length > 0 && handle.pending[0].timestamp <= toTimestamp) {
+    while (handle.pending.length > 0 && handle.pending[0].t_ms <= toTimestamp) {
       const msg = handle.pending.shift()!;
       handle.ws.send(msg.data);
     }
@@ -1856,7 +1865,7 @@ async function deliverPendingMessages(
   // SSE messages (browser side — deliver via page.evaluate)
   await page.evaluate((ts) => {
     for (const sse of (window as any).__eyespy_sseInstances || []) {
-      while (sse._pendingEvents.length > 0 && sse._pendingEvents[0].timestamp <= ts) {
+      while (sse._pendingEvents.length > 0 && sse._pendingEvents[0].t_ms <= ts) {
         sse._deliverNext();
       }
     }

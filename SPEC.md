@@ -162,7 +162,15 @@ Replays recorded sessions in headless Chromium with deterministic environment.
   - `performance.mark()` / `performance.measure()`: Stubbed by clock (return no-ops). Document that Performance Observer / Navigation Timing APIs return empty results.
 - **Playwright `animations: 'disabled'`**: Option on `page.screenshot()` (NOT browser/context level). Passed on every screenshot call: `page.screenshot({ animations: 'disabled' })`. Handles CSS animations + CSS transitions + WAAPI. Protocol-level, not CSS injection. Finite animations fast-forwarded to completion. Infinite animations cancelled. No conflict with clock mocking (different layers).
 - Additional anti-flake CSS: `caret-color: transparent; scroll-behavior: auto !important`
-- **Browser flags**: Try `--deterministic-mode` first (meta-flag intended to set `--run-all-compositor-stages-before-draw`, `--enable-begin-frame-control`, `--disable-threaded-animation`, `--disable-threaded-scrolling`, `--disable-checker-imaging`, `--disable-image-animation-resync`). **Fallback**: if `--deterministic-mode` is not recognized by the Chromium version bundled with Playwright (verify in Phase 0 PoC), set all 6 component flags individually. Additionally: `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
+- **Browser flags**: **Do NOT use `--deterministic-mode`** — it enables `--enable-begin-frame-control` which requires manual CDP `HeadlessExperimental.beginFrame` commands. Playwright's `page.screenshot()` does not issue these, causing it to hang indefinitely ([Playwright #31829](https://github.com/microsoft/playwright/issues/31829)). Playwright's maintainer: "If you touch `args`, you are on your own!" Instead, set the individual compositor flags that ARE safe with Playwright:
+  - `--run-all-compositor-stages-before-draw` — forces full compositor pipeline before draw
+  - `--disable-threaded-animation` — deterministic animation timing on compositor thread
+  - `--disable-threaded-scrolling` — deterministic scroll on compositor thread
+  - `--disable-checker-imaging` — no progressive image decode placeholders
+  - `--disable-image-animation-resync` — prevents GIF/APNG resync to system clock
+  - `--disable-new-content-rendering-timeout` — no timeout for new content rendering
+  - **Explicitly DO NOT set** `--enable-begin-frame-control` — this is what causes the hang
+  - Additionally: `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, `--hide-scrollbars`, `--disable-font-subpixel-positioning`, `--disable-lcd-text`, `--disable-skia-runtime-opts`, `--disable-partial-raster`
 - Fixed viewport: 1280x720, deviceScaleFactor: 1
 - **Headless mode**: Use `headless: true` (Playwright's default, which uses the new headless mode since Playwright 1.33). The old headless mode (`headless: 'shell'`) uses a separate headless shell binary with different rendering behavior. The new headless mode uses the same Chromium binary as headed mode — critical for screenshot consistency. Recording uses headed mode (`headless: false`) so the user can interact.
 - **Fresh BrowserContext per session** (NOT a new browser process — reuse the same `Browser` instance for all sessions within a run, create a new `BrowserContext` for each): Each replay session starts with clean state — no localStorage, IndexedDB, cookies, or Service Workers from previous sessions. `browserContext` created with `storageState: undefined`, `serviceWorkers: 'block'`. Smart retry also creates fresh contexts (same browser).
@@ -2757,7 +2765,7 @@ Set `resetOnNavigation: false` to accumulate coverage across SPA navigations wit
 The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a determinism matrix. Each app archetype targets a specific risk. If ANY archetype produces non-identical screenshots across 10 runs, we stop and investigate before committing to the architecture.
 
 **Shared setup** (all archetypes):
-1. Launches Playwright, tests `--deterministic-mode` flag — if Chromium rejects it, fall back to the 6 individual compositor flags. **Log which path was taken.**
+1. Launches Playwright with the 6 individual compositor flags (NOT `--deterministic-mode` — see Browser flags section). Plus `--font-render-hinting=none`, `--disable-gpu`, `--force-color-profile=srgb`, etc.
 2. Injects PRNG seeding via `addInitScript()` (Math.random, crypto.randomUUID, crypto.getRandomValues)
 3. Installs `clock.install()` with fixed time + patches for `document.timeline.currentTime` and `MessageChannel`
 4. Takes screenshots with Node.js orchestrated polling (waitForDomSettle) + stabilization loop
@@ -2796,7 +2804,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 - CSS-in-JS class generation is deterministic (same styles → same class names across runs)
 - Complex component libraries (MUI, date pickers) render identically under the anti-flake stack
 - Node.js orchestrated polling works with paused clock
-- `--deterministic-mode` or individual compositor flags produce stable screenshots
+- Individual compositor flags (without `--enable-begin-frame-control`) produce stable screenshots
 - PRNG seeding catches `crypto.randomUUID()` / `crypto.getRandomValues()` before any page JS
 - SSR hydration + streaming HTML settles deterministically (if archetype F included)
 
@@ -2812,7 +2820,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 - `.eyespy/` directory structure, `eyespy init` auto-creation (config.json + baselines.json + .gitignore updates)
 
 **Week 2: Replay Engine (CRITICAL PATH)**
-- Playwright launcher with `--deterministic-mode` + full anti-flake flags + `animations: 'disabled'`
+- Playwright launcher with 6 individual compositor flags + font/GPU/color flags + `animations: 'disabled'` (NOT `--deterministic-mode`)
 - PRNG injection via `context.addInitScript()` (Math.random, crypto.randomUUID, crypto.getRandomValues)
 - Full `clock.install()` with `pauseAt`/`runFor`/`resume` lifecycle (Playwright >= 1.48)
 - Clock gap patches via `addInitScript()`: `document.timeline.currentTime` (#38951), `MessageChannel` timing
@@ -2913,7 +2921,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 | **No Math.random/crypto seeding** | P0 | `addInitScript()` seeded PRNG. Table-stakes. Validated in Phase 0 PoC. |
 | **Clock API edge cases (post-#31924 fix)** | P0 | Full `clock.install()` on >= 1.48. Fix landed but is "best-effort". Phase 0 PoC validates. Custom `addInitScript` patches for `document.timeline.currentTime` (#38951) and `MessageChannel` timing (React 18+ scheduler). Fallback: Date-only mock via `addInitScript()` if edge cases hit. |
 | **Clock install/pauseAt race (#33926)** | P0 | Between `clock.install({ time: T })` and `clock.pauseAt(T)`, the clock runs. If both use the same time, `pauseAt` can fail with "Cannot fast-forward to the past." Fix: install 1s before target time. Already applied in orchestrator code. |
-| **`--deterministic-mode` flag availability** | P0 | Meta-flag sets 6 compositor/animation flags. Verify presence in target Playwright Chromium version during Phase 0 PoC. If missing, set component flags individually. |
+| **Compositor flag effectiveness (without `--deterministic-mode`)** | P0 | `--deterministic-mode` is UNUSABLE — it enables `--enable-begin-frame-control` which hangs `page.screenshot()` ([#31829](https://github.com/microsoft/playwright/issues/31829)). We use the 6 individual compositor flags instead. Phase 0 PoC validates that these alone produce stable screenshots. Chromatic proves this approach works at scale (7.3B+ tests, vanilla Chrome, no BeginFrame control). |
 | **Baseline blob availability (team sharing)** | P1 | `baselines.json` manifest is git-tracked but actual PNGs are in local blob store (gitignored). Teams need `eyespy pull-baselines` before first CI run. Document onboarding. Remote storage (S3/R2) is pluggable. |
 | **catch-all route causes flakiness (#22338)** | P0 | Targeted per-origin routes, not `**/*`. |
 | **CORS preflights bypass routes (#37245)** | P0 | Document limitation. Playwright auto-fulfills OPTIONS with 204 when interception active. |

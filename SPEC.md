@@ -186,7 +186,9 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Mock mode**: Layer 2 fulfills recorded fetch/XHR responses when matched, aborts unrecorded fetch/XHR (`route.abort('connectionrefused')`), and continues other resource types.
 - **Live mode**: Layer 2 is not registered. Layer 1 still enforces egress policy. By default, live mode denies requests to origins not in `replay.allowedOrigins` (prevents malicious PRs from exfiltrating CI secrets or scanning internal networks). Set `replay.allowLiveExternalEgress: true` to explicitly allow unrestricted egress.
 - **Origin remapping** (handles recording at `localhost:3000`, replaying at `ci:3000`): Config `replay.originMap` maps recorded origins to replay origins. Applied uniformly to: (a) route interception patterns, (b) FIFO queue keys, (c) session event URL matching. **Auto-infer**: if `originMap` is empty, the replay engine computes `{ recordedSessionOrigin → targetUrl origin }` automatically. For multi-origin apps (e.g., separate API server), provide explicit mappings: `{ "http://localhost:4000": "http://ci-api:4000" }`. All URL normalization passes through `remapUrl()` which applies the origin map before any matching.
-- **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins **any request** (fetch, xhr, document, image, font, etc.) can reach. Enforced by the Layer 1 global route. Default: `[targetUrl origin]` + all origins in `originMap` values. Non-allowed origins aborted with `route.abort('blockedbyclient')`.
+- **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins **any request** (fetch, xhr, document, image, font, etc.) can reach. Enforced by the Layer 1 global route. Non-allowed origins aborted with `route.abort('blockedbyclient')`.
+  - **Playwright-recorded sessions**: The recorder auto-discovers all origins observed during recording and persists them in `session.observedOrigins[]`. At replay time, the effective allowlist is: `[targetUrl origin]` + `originMap` values + `session.observedOrigins` + explicit `replay.allowedOrigins`. This handles CDN fonts/scripts/images automatically.
+  - **SDK-recorded sessions**: The SDK only captures fetch/XHR, not subresource loads (images, fonts, scripts). Allowlist defaults to `[targetUrl origin]` + `originMap` values + explicit `replay.allowedOrigins`. Teams with CDN-heavy apps must manually add CDN origins to `replay.allowedOrigins`.
 - **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
 - **WebSocket/SSE (Phase 1b)**: WS mocking via `page.routeWebSocket()` (Playwright 1.48+), SSE mocking via `addInitScript()` EventSource replacement. **Phase 1a behavior**: WS and SSE connections are blocked (`route.abort()` for WS upgrade requests, EventSource constructor replaced with no-op) and logged as `W_WS_BLOCKED` / `W_SSE_BLOCKED`. This prevents nondeterminism from unmocked real-time connections.
 - **CORS preflights**: If OPTIONS requests are intercepted by Playwright, auto-fulfill with `204` and dynamic `Access-Control-Allow-*` headers based on the request. If the Playwright version does not surface preflights, fail fast with `E_CORS_PREFLIGHT_UNSUPPORTED` when a preflight-dependent request fails in mock mode, and recommend switching that origin to live mode.
@@ -208,10 +210,11 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 **Phase 1a**: Strategies 1-5 (basic healing) + skip-and-warn if all fail. If >30% of interactions fail, abort session as unreplayable.
 **Phase 1b**: Full cascade + healing overlay (don't mutate recordings), confidence scoring, interaction dependency graph for cascade-skipping, explicit "promote healing" action, auto-promotion policy (>= 0.90 confidence across 3 consecutive runs).
 
-**Network mock miss handling**: When a request during replay doesn't match any recorded response:
-- Log the unmatched URL + method + query params as a diagnostic
-- In mock mode: abort the request (`route.abort('connectionrefused')`) — don't hang
-- In live mode: pass through to real backend
+**Network mock miss handling**: When a fetch/XHR request during replay doesn't match any recorded response, behavior depends on `replay.unmatchedFetchXhrPolicy`:
+- `"error"` (recommended for CI): abort the request, mark session as `error` (exit code 2). Strict — any unrecorded API call is treated as a test failure.
+- `"warn"` (default): abort the request (`route.abort('connectionrefused')`), continue replaying. Session can still pass/diff. All misses reported in `summary.json` as `W_ROUTE_MISS_MOCK`.
+- `"passThrough"`: allow the request to hit the real network (subject to egress allowlist), log warning. Useful during migration from live to mock mode.
+- In live mode (regardless of policy): pass through to real backend.
 - After replay: report all mock misses in the run summary
 - **Fuzzy URL matching** (Phase 1b): Ignore configurable query params (e.g., `_t`, `timestamp`, `nonce`) when matching FIFO queues. Match on path pattern when exact URL fails.
 
@@ -405,7 +408,14 @@ Used by CI integrations (PR comments, Slack notifications, dashboards) without p
 ```json
 {
   "version": 1,
-  "renderer": { "playwrightVersion": "1.50.0", "dockerImage": "mcr.microsoft.com/playwright:v1.50.0-noble" },
+  "renderer": {
+    "playwrightVersion": "1.50.0",
+    "chromiumVersion": "133.0.6943.16",
+    "dockerImage": "mcr.microsoft.com/playwright:v1.50.0-noble",
+    "viewport": { "width": 1280, "height": 720, "deviceScaleFactor": 1 },
+    "chromiumArgsHash": "sha256:a1b2c3d4...",
+    "screenshotOptions": { "type": "png", "animations": "disabled" }
+  },
   "baselines": {
     "session-abc123": {
       "nav@e0": { "digest": "sha256:e3b0c44298fc1c14...", "width": 1280, "height": 720 },
@@ -465,7 +475,8 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "allowedOrigins": [],
     "allowLiveExternalEgress": false,
     "missingBaselinePolicy": "warn",
-    "rendererMismatchPolicy": "warn"
+    "rendererMismatchPolicy": "warn",
+    "unmatchedFetchXhrPolicy": "warn"
   },
   "storage": {
     "backend": "local",
@@ -498,7 +509,14 @@ Local HTTP server for ingesting SDK recordings. **Not a production service** —
 - Binds to `127.0.0.1` (localhost only) unless `--host 0.0.0.0` explicitly provided
 - Requires `X-Eyespy-Token` header unless `--no-auth` explicitly provided (discouraged)
 - Token: auto-generated on startup and printed to terminal, or provided via `--token` / `EYESPY_TOKEN` env var
-- CORS disabled by default; enable with `--cors-origin http://localhost:3000`
+- CORS behavior:
+  - If `--cors-origin` provided: allow exactly that origin.
+  - If not provided and `.eyespy/config.json` exists: default to allowing the `targetUrl` origin (port-sensitive). This makes the SDK recording happy path work out-of-box.
+  - Otherwise: CORS disabled (explicit opt-in required).
+- MUST implement `OPTIONS` preflight for SDK use:
+  - `Access-Control-Allow-Methods: GET, POST, OPTIONS`
+  - `Access-Control-Allow-Headers: Content-Type, Content-Encoding, Idempotency-Key, X-Eyespy-Token`
+  - `Access-Control-Max-Age: 600`
 - Rate limit: 100 req/s per session (prevent runaway SDK)
 
 **Endpoints**:
@@ -544,7 +562,7 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `E_SESSION_TIMEOUT` | Replay | Session replay exceeded timeout (default 120s) |
 | `E_PW_CRASH` | Replay | Browser/page crashed during replay |
 | `E_DIMENSION_MISMATCH` | Diff | Screenshot dimensions differ from baseline |
-| `E_ROUTE_MISS` | Replay | Unrecorded fetch/XHR request in mock mode (logged, not fatal per-request) |
+| `E_ROUTE_MISS` | Replay | Unrecorded fetch/XHR in mock mode; severity depends on `replay.unmatchedFetchXhrPolicy` |
 | `E_SESSION_UNREPLAYABLE` | Replay | >30% of interactions failed auto-healing |
 | `E_SCHEMA` | Receiver | Invalid request body |
 | `E_EVENTS_OUT_OF_ORDER` | Receiver | Event batch has non-contiguous `seq` values or `seq` not sorted ascending |
@@ -1066,7 +1084,8 @@ interface RecordedSession {
   viewport: { width: number; height: number };
   userAgent: string;
   captureMethod: 'playwright' | 'sdk';  // Which recorder produced this session
-  events: RecordedEvent[];       // Chronological, monotonic t_ms values (ms offset from session start, NOT epoch)
+  observedOrigins?: string[];    // All origins seen during recording (Playwright recorder auto-populates; SDK omits)
+  events: RecordedEvent[];       // Sorted by seq ascending, t_ms non-decreasing (ms offset from session start, NOT epoch)
   // Network body storage: Response bodies are always referenced by `bodyHash` on
   // individual response NetworkEvents, pointing to SHA-256 keys in .eyespy/blobs/.
   // The SDK receiver converts inline bodies to blob hashes on ingest.
@@ -1128,9 +1147,15 @@ interface Modifiers {
   alt: boolean;
 }
 
+// Body representation for network events. Handles text, binary, truncated, and omitted bodies unambiguously.
+type BodyRef =
+  | { kind: 'none' }                                                                    // No body (GET request, 204 response, etc.)
+  | { kind: 'inline'; encoding: 'utf8' | 'base64'; data: string; truncated: boolean; byteLength: number; contentType?: string }  // Small bodies stored inline
+  | { kind: 'blob'; digest: string /* sha256:... */; truncated: boolean; byteLength: number; contentType?: string };               // Large bodies stored in blob store
+
 type NetworkEvent =
-  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; bodyCapture: 'full' | 'truncated' | 'omitted' | 'error'; t_ms: number }
-  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash?: string; bodyCapture: 'full' | 'truncated' | 'omitted' | 'error'; durationMs: number; error?: string }
+  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body: BodyRef; t_ms: number }
+  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; body: BodyRef; durationMs: number; error?: string }
   | { type: 'ws-open'; wsId: string; url: string; t_ms: number }
   | { type: 'ws-send'; wsId: string; url: string; data: string; t_ms: number }
   | { type: 'ws-receive'; wsId: string; url: string; data: string; t_ms: number }
@@ -2622,14 +2647,15 @@ Use `junit-report-builder` npm package. GitLab requires `<testsuites>` wrapper (
 
 **HTML report** — Standalone single-file with all images base64-inlined (reg-cli pattern):
 
-1. Template HTML with `{{css}}`, `{{js}}`, `{{data}}` placeholders
-2. Bundled viewer app (vanilla JS or Preact, ~5KB) injected inline
-3. Report data as `window.__EYESPY_DATA__` JSON blob
+1. Template HTML with `{{css}}`, `{{nonce}}`, `{{js}}`, `{{data}}` placeholders
+2. Bundled viewer app (vanilla JS or Preact, ~5KB) injected as `<script nonce="{{nonce}}">`
+3. Report data as `<script type="application/json" id="eyespy-data">{{data}}</script>` (non-executable)
 4. Images as `data:image/png;base64,...` data URLs
+5. Nonce generated as 16 random bytes (base64) at report build time
 
 Four viewer modes: side-by-side, slider (CSS `clip-path`), blend (opacity crossfade), toggle (click to switch).
 
-**Security**: All session-derived strings (session IDs, file names, error messages) MUST be HTML-escaped before injection into the report template. The report MUST include a restrictive CSP meta tag (`<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' data:; script-src 'unsafe-inline'">`) to prevent execution of any external scripts. This protects against XSS if session data contains malicious content.
+**Security**: All session-derived strings (session IDs, file names, error messages) MUST be HTML-escaped before injection into the report template. Report data MUST be embedded as `<script type="application/json" id="eyespy-data">...</script>` (non-executable JSON, not a JS assignment). The report MUST use nonce-based CSP: `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'nonce-{RANDOM}'; base-uri 'none'; frame-ancestors 'none'">`. Only the viewer script tag gets the nonce. This means even if HTML escaping is missed somewhere, injected scripts cannot execute because they lack the nonce.
 
 **Size warning**: Base64 inflates images ~33%. 50 screenshots at 200KB each = 13MB HTML. For suites over 30 screenshots, default to folder-based report with separate image files, standalone HTML as opt-in (`--inline-report`).
 

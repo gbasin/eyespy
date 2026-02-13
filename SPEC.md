@@ -31,9 +31,9 @@ No open-source alternative provides the full pipeline. Lost Pixel, Argos CI, and
 - Single-team for V1 (no multi-tenancy)
 - GitHub OAuth + RBAC when server ships (Phase 2)
 - **Clock**: Full `clock.install()` on Playwright >= 1.48. Date + setTimeout + setInterval all mocked. Custom `addInitScript` patches for `document.timeline.currentTime` and `MessageChannel` timing.
-- **Network**: Block all unrecorded origins in mock mode (fully isolated replay)
+- **Network mock mode**: Mock recorded fetch/XHR requests (any origin), abort unrecorded fetch/XHR, allow document/script/stylesheet/image/font/media loads through to real server. ResourceType-based routing, not origin-based.
 - **Auto-healing replay**: Basic fallback cascade in 1a, advanced healing overlay + confidence scoring in 1b
-- **Response bodies**: No size limit, store in blobs. Strip sensitive headers only (Auth, Cookie, Set-Cookie). Document security implications. No body redaction (breaks replay).
+- **Response bodies**: Blob store has no size limit. Recorders have configurable capture limits (`maxBodyBytes`: SDK default 256KB, Playwright recorder default 1MB). Bodies larger than limit are truncated with `bodyTruncated: true` flag. Strip sensitive headers (Auth, Cookie, Set-Cookie). No body redaction (breaks replay).
 - **Shared package**: Types + shared logic (selector matching, session validation, network normalization)
 - **Recording UX**: Minimal floating overlay ("Stop Recording" button + event counter, z-index max). Ctrl+C in terminal also stops. Overlay excluded from screenshots and selector generation.
 - Scope: Standard SPAs + common widgets. Out of scope for V1: cross-origin iframes, WebGL, PWAs/Service Workers
@@ -142,7 +142,7 @@ Lightweight JS injected via script tag. Records clickstream + network, NOT DOM m
 - `Authorization`, `Cookie`, `Set-Cookie` headers stripped by default
 - Configurable POST body deny-list for sensitive paths (`/login`, `/checkout`, etc.)
 - **Production kill switch**: `allowedHosts` allowlist, default sampling 0% for unknown origins
-- **Mutation throttle**: Stop recording after 10,000 DOM mutations per 10-second window (Sentry pattern)
+- **Mutation throttle** (safety kill switch, NOT mutation recording): The SDK does NOT record DOM mutations. This is a MutationObserver-based safety detector that measures DOM mutation frequency. If > 10,000 mutations in a 10-second window (Sentry pattern), the SDK stops recording entirely and emits a terminal event `{ type: 'recording-stopped', reason: 'mutation-throttle' }`. Prevents runaway pages/extensions from consuming unbounded memory.
 
 **Framework notes**:
 - Angular/zone.js: Document initialization order. SDK must load before zone.js patches.
@@ -177,8 +177,10 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`. Font loading works correctly with paused clock because: `@font-face` triggers network requests → fulfilled by route handlers (Node.js, real time) → browser font renderer processes data (rendering pipeline, not JS timers) → `document.fonts.ready` resolves. The clock mock only affects JS-level timer APIs, not network completion or rendering.
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
-**Network mocking**: **Targeted route patterns** — route only recorded origins (e.g., `page.route('**/api.stripe.com/**')`) instead of catch-all `**/*`. Catch-all introduces flakiness (#22338).
-- **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay. Unmatched requests: abort (mock mode) or pass through (live mode).
+**Network mocking**: **ResourceType-based routing** — mock only `fetch` and `xhr` resource types (the data layer), allow `document`, `script`, `stylesheet`, `image`, `font`, `media`, `manifest` through to the real server (the rendering layer). This means same-origin API calls (`/api/users`) get mocked while the app's HTML/JS/CSS loads normally from the target URL. Use **targeted route patterns** per recorded origin (e.g., `page.route('**/api.stripe.com/**')`) instead of catch-all `**/*`. Catch-all introduces flakiness (#22338). Route handler checks `request.resourceType()` before matching — if not `fetch`/`xhr`, call `route.continue()`.
+- **Mock mode**: Mock recorded fetch/XHR, abort unrecorded fetch/XHR (`route.abort('connectionrefused')`), allow all other resource types through.
+- **Live mode**: No fetch/XHR mocking — all requests pass through to real backend. Optional WS/SSE replay.
+- **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
 - **WebSocket mocking**: `page.routeWebSocket()` (Playwright 1.48+). Replay recorded frames in order with timing.
 - **SSE mocking**: Replace `EventSource` via `addInitScript()` with a mock that serves recorded events.
 - **CORS preflights**: Cannot intercept (#37245). Document limitation. Mock mode should serve responses without CORS restrictions.
@@ -222,6 +224,18 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - **Clock lifecycle per screenshot**: `clock.pauseAt()` before capture (freeze all timers), take stabilized screenshot, `clock.resume()` before next interaction.
 - Configurable via `screenshotStrategy` in config: `"tiered"` (default), `"every"` (every event), `"manual"` (only explicit `screenshot-marker` events)
 
+**Screenshot key stability** (prevents baseline churn from skipped interactions):
+Screenshot keys are derived from **event identity** (the event's 0-based index in `session.events`), NOT sequential capture count. This means if an interaction is skipped by auto-healing, later screenshot keys don't shift.
+
+Key format: `{type}@e{eventIndex}` where:
+- `nav@e{i}` — post-navigation capture (after a `navigate` event at index `i`)
+- `cap@e{i}` — capture after an interaction event (click/submit/etc.) at index `i`
+- `final` — end-of-session capture (always last)
+
+Example: If events are `[navigate(0), click(1), input(2), click(3), navigate(4)]` and the tiered strategy captures after navigate(0), click(1), click(3), navigate(4), and end-of-session, the keys are: `nav@e0`, `cap@e1`, `cap@e3`, `nav@e4`, `final`. If click(1) is skipped by auto-healing, the remaining keys (`cap@e3`, `nav@e4`, `final`) are unchanged — no renumbering.
+
+If a capture point fails (page crash, timeout), the key still exists in the run output as `{ status: "error", error: "..." }` — later keys do not shift.
+
 **Smart retry**: Replay once. If any screenshot diff detected vs baseline, replay 2 more times to confirm. Majority vote (2-of-3 must show diff for it to count). Only pays 3x cost for actual diffs (~5-20% of screenshots). **Default ON, Phase 1a.** Coverage collection is OFF during retry attempts — we already have the coverage bitmap from the first replay. Retry attempts exist solely to confirm/reject visual diffs.
 
 **Fresh context per retry** (critical implementation detail): FIFO network queues are consumed by `.shift()` during replay — after the first replay, all queues are empty. Each retry attempt MUST:
@@ -232,7 +246,7 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 
 This means the retry function signature is: `replaySession(session, seed) → screenshots[]`. The orchestrator calls it up to 3 times for sessions with diffs, each call is fully independent. The orchestrator only compares specific screenshots that diffed, not the entire session.
 
-**Coverage collection**: `page.coverage.startJSCoverage({ resetOnNavigation: false })`. Extract branch-level bitmap. Version-stamp with `sourceContentHash` — SHA-256 of the concatenated `entry.source` strings from coverage output. This hashes what V8 actually executed, not build artifacts. Modern bundlers (webpack, vite, esbuild) are NOT deterministic between builds — same source can produce different output due to chunk hashing, timestamps, parallel processing artifacts. Hashing V8's script source at runtime eliminates this problem entirely. Only invalidate bitmaps when the source hash changes. `resetOnNavigation: false` accumulates coverage across SPA navigations within a session.
+**Coverage collection**: `page.coverage.startJSCoverage({ resetOnNavigation: false })`. Extract V8 block coverage bitmap (note: V8 "block coverage" ranges approximate but are not identical to source-level branches — they represent executed byte ranges within functions. We call these "coverage bitmaps" throughout; user-facing "branch coverage %" is an approximation). Version-stamp with `sourceContentHash` — SHA-256 of the concatenated `entry.source` strings from coverage output. This hashes what V8 actually executed, not build artifacts. Modern bundlers (webpack, vite, esbuild) are NOT deterministic between builds — same source can produce different output due to chunk hashing, timestamps, parallel processing artifacts. Hashing V8's script source at runtime eliminates this problem entirely. Only invalidate bitmaps when the source hash changes. `resetOnNavigation: false` accumulates coverage across SPA navigations within a session.
 
 **Coverage limitation (mocked network)**: V8 coverage tracks which branches execute. With network mocking, responses come from FIFO queues, not real servers. If the app has different code paths for different response shapes/timings/errors, coverage won't capture all production paths. This is inherent — coverage reflects the recorded session's behavior, not all possible behaviors. Document this to users.
 
@@ -252,7 +266,7 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 ### 3. Test Generator (Coverage-Based Selection)
 
 **Algorithm**:
-1. For each recorded session: replay with V8 coverage ON, extract branch-level coverage bitmap
+1. For each recorded session: replay with V8 coverage ON, extract V8 block coverage bitmap
 2. Version-stamp bitmap with `(gitSha, sourceContentHash)`
 3. Deduplicate: sessions with identical bitmaps → keep one (same flow, different data)
 4. Greedy set cover: iteratively select session covering most uncovered branches
@@ -336,14 +350,21 @@ JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 
   "playwrightVersion": "1.50.0",
   "exitCode": 1,
   "sessions": [
-    { "id": "session-abc", "status": "pass", "screenshots": 5, "diffCount": 0, "durationMs": 3200 },
-    { "id": "session-def", "status": "diff", "screenshots": 4, "diffCount": 2, "durationMs": 4100, "confirmedDiffs": ["002-click-submit", "004-end"] },
-    { "id": "session-ghi", "status": "error", "reason": "Navigation timeout", "durationMs": 30000 }
+    { "id": "session-abc", "status": "pass", "screenshots": 5, "diffCount": 0, "durationMs": 3200, "errors": [], "warnings": [] },
+    { "id": "session-def", "status": "diff", "screenshots": 4, "diffCount": 2, "durationMs": 4100, "confirmedDiffs": ["cap@e5", "final"], "errors": [], "warnings": [{ "code": "W_BODY_TRUNCATED", "message": "2 responses truncated at maxBodyBytes", "count": 2 }] },
+    { "id": "session-ghi", "status": "error", "durationMs": 30000, "errors": [{ "code": "E_NAV_TIMEOUT", "message": "Navigation timeout after 30000ms", "details": { "url": "http://localhost:3000/checkout" } }], "warnings": [] }
   ],
   "totals": { "sessions": 3, "passed": 1, "diffs": 1, "errors": 1, "screenshots": 9, "diffScreenshots": 2, "durationMs": 37300 }
 }
 ```
 Used by CI integrations (PR comments, Slack notifications, dashboards) without parsing CLI text output.
+
+**Logging contract**:
+- **stdout**: Reserved for JSON output when `--json` or piped (`!process.stdout.isTTY`). Human-formatted output otherwise.
+- **stderr**: All diagnostic logs, progress bars (cli-progress), spinners (ora). Suppressed when `--json` or piped.
+- **Correlation IDs**: Every log line includes `runId`. Per-session logs include `sessionId`. Network events include `requestId`.
+- **`--verbose`**: Enables debug-level logs — route matching decisions, healing attempts + confidence scores, stabilization loop iteration count, clock lifecycle transitions, FIFO queue hits/misses.
+- **Structured logging**: Internal log format is `{ level, timestamp, runId, sessionId?, message, data? }`. Written as formatted text to stderr in TTY mode.
 
 ### 6. Storage (Manifest + Content-Addressable Blobs)
 
@@ -375,8 +396,9 @@ Used by CI integrations (PR comments, Slack notifications, dashboards) without p
   "version": 1,
   "baselines": {
     "session-abc123": {
-      "001-page-load": { "hash": "sha256:e3b0c44...", "width": 1280, "height": 720 },
-      "002-click-submit": { "hash": "sha256:a1f2b3c...", "width": 1280, "height": 720 }
+      "nav@e0": { "hash": "sha256:e3b0c44...", "width": 1280, "height": 720 },
+      "cap@e5": { "hash": "sha256:a1f2b3c...", "width": 1280, "height": 720 },
+      "final": { "hash": "sha256:d4e5f6a...", "width": 1280, "height": 720 }
     }
   }
 }
@@ -433,6 +455,8 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
   },
   "recording": {
     "receiverPort": 8479,
+    "maxBodyBytes": 262144,
+    "bodyCapture": "truncate",
     "excludePaths": [],
     "sensitiveHeaders": ["Authorization", "Cookie", "Set-Cookie"]
   },
@@ -442,6 +466,78 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
   }
 }
 ```
+
+### 8. Receiver API (Phase 1b: `eyespy record --listen`)
+
+Local HTTP server for ingesting SDK recordings. **Not a production service** — runs during recording sessions only.
+
+**Safe defaults**:
+- Binds to `127.0.0.1` (localhost only) unless `--host 0.0.0.0` explicitly provided
+- Requires `X-Eyespy-Token` header unless `--no-auth` explicitly provided (discouraged)
+- Token: auto-generated on startup and printed to terminal, or provided via `--token` / `EYESPY_TOKEN` env var
+- CORS disabled by default; enable with `--cors-origin http://localhost:3000`
+- Rate limit: 100 req/s per session (prevent runaway SDK)
+
+**Endpoints**:
+
+`GET /health` — Health check
+- Response 200: `{ "ok": true, "version": "0.1.0" }`
+
+`POST /v1/sessions` — Create session container
+- Request: `{ "sessionId": "uuid", "startedAt": "ISO-8601", "url": "string", "viewport": { "width": 1280, "height": 720 }, "userAgent": "string", "sdk": { "version": "string" } }`
+- Response 201: `{ "sessionId": "uuid" }`
+- Errors: `400 E_SCHEMA`, `409 E_SESSION_EXISTS`
+
+`POST /v1/sessions/{sessionId}/events` — Ingest event batch
+- Headers: `Content-Type: application/json`, optional `Content-Encoding: gzip`
+- Request: `{ "events": [RecordedEvent...] }`
+- Response 202: `{ "accepted": true, "eventCount": N }`
+- Receiver: validates schema, appends to `.eyespy/sessions/.incoming/{sessionId}/`, extracts large bodies to blob store
+- Errors: `400 E_SCHEMA`, `413 E_BATCH_TOO_LARGE` (> 5MB), `429 E_RATE_LIMIT`
+
+`POST /v1/sessions/{sessionId}/finish` — Finalize session
+- Request: `{ "endedAt": "ISO-8601" }`
+- Response 200: `{ "sessionId": "uuid", "path": ".eyespy/sessions/{id}.json" }`
+- Errors: `404 E_SESSION_NOT_FOUND`, `409 E_SESSION_NOT_OPEN`
+
+**Error response format** (all non-2xx):
+```json
+{ "error": { "code": "E_SCHEMA", "message": "Human-readable description", "details": {} } }
+```
+
+### 9. Error Code Registry
+
+Machine-readable error/warning codes used in `summary.json`, receiver responses, and CLI output.
+
+**Errors** (cause exit code 2):
+| Code | Context | Description |
+|------|---------|-------------|
+| `E_CFG_PARSE` | CLI | Config file is not valid JSON |
+| `E_CFG_SCHEMA` | CLI | Config file fails schema validation |
+| `E_SESSION_SCHEMA` | Replay | Session file fails schema validation |
+| `E_SESSION_VERSION` | Replay | Session formatVersion is unsupported |
+| `E_BLOB_MISSING` | Diff | Referenced blob hash not found in store or remote |
+| `E_NAV_TIMEOUT` | Replay | Navigation exceeded timeout (default 30s) |
+| `E_SESSION_TIMEOUT` | Replay | Session replay exceeded timeout (default 120s) |
+| `E_PW_CRASH` | Replay | Browser/page crashed during replay |
+| `E_DIMENSION_MISMATCH` | Diff | Screenshot dimensions differ from baseline |
+| `E_ROUTE_MISS` | Replay | Unrecorded fetch/XHR request in mock mode (logged, not fatal per-request) |
+| `E_SESSION_UNREPLAYABLE` | Replay | >30% of interactions failed auto-healing |
+| `E_SCHEMA` | Receiver | Invalid request body |
+| `E_SESSION_EXISTS` | Receiver | Session ID already exists |
+| `E_SESSION_NOT_FOUND` | Receiver | Session ID not found |
+| `E_BATCH_TOO_LARGE` | Receiver | Event batch exceeds 5MB |
+| `E_RATE_LIMIT` | Receiver | Too many requests |
+
+**Warnings** (logged, don't affect exit code):
+| Code | Context | Description |
+|------|---------|-------------|
+| `W_BODY_TRUNCATED` | Replay | Response body was truncated during recording; FIFO matching may degrade |
+| `W_HEALING_USED` | Replay | Selector healed via fallback strategy (includes confidence) |
+| `W_ROUTE_MISS_LIVE` | Replay | Unrecorded request passed through in live mode |
+| `W_BASELINE_MISSING` | Diff | No baseline exists for this screenshot (treated as "new") |
+| `W_RENDERER_MISMATCH` | Diff | Playwright version differs from baseline renderer |
+| `W_STALE_COVERAGE` | Generate | Coverage bitmap sourceContentHash doesn't match current build |
 
 ---
 
@@ -453,7 +549,7 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
 | Replay engine | **Playwright >= 1.48** | Clock API (with #31924 fix), routeWebSocket, animations:disabled |
 | CLI | **Commander.js** | Lightweight, standard |
 | Image diff | **pixelmatch + sharp** | Industry standard |
-| Coverage | **Playwright `page.coverage` API** (V8 Profiler) | Branch-level precision, Chromium-only (Firefox/WebKit don't support JS coverage) |
+| Coverage | **Playwright `page.coverage` API** (V8 Profiler) | V8 block coverage (byte-range precision, approximates branch coverage), Chromium-only (Firefox/WebKit don't support JS coverage) |
 | Monorepo | **pnpm workspaces + Turborepo** | Fast builds |
 | Lint/Format | **Biome** | Single tool |
 | Test runner | **Vitest** | Fast, Vite-native |
@@ -520,11 +616,13 @@ Concrete implementation patterns, data structures, and lessons learned from rese
 **Fetch interception** — Direct monkey-patch, NOT ES6 Proxy. Every production recording tool (OpenReplay, Sentry, Highlight.io) replaces `window.fetch` directly. ES6 Proxy adds overhead and breaks `instanceof` checks.
 
 ```typescript
-// Max request/response body size to capture (bytes). Bodies larger than this are truncated,
-// which means body-fingerprinted FIFO matching may not work for very large POST bodies.
-// 64KB covers GraphQL queries (typically < 10KB) and most REST API payloads.
-// File uploads (multi-MB) are intentionally truncated — they're too large to store in session JSON.
-const MAX_BODY_SIZE = 64 * 1024; // 64KB
+// Max request/response body size to capture (bytes). Configurable via config.recording.maxBodyBytes.
+// SDK default: 256KB. Playwright recorder default: 1MB.
+// Bodies larger than this are truncated (bodyTruncated: true in event), which means
+// body-fingerprinted FIFO matching may degrade for large POST bodies.
+// 256KB covers GraphQL queries (typically < 10KB) and most REST API payloads.
+// File uploads (multi-MB) are intentionally truncated — too large for session JSON.
+const MAX_BODY_SIZE = config.recording?.maxBodyBytes ?? 256 * 1024; // 256KB default
 
 // Store original before any framework loads
 const _originalFetch = window.fetch.bind(window);
@@ -1848,7 +1946,7 @@ function toModifiers(m: Modifiers): Array<'Alt' | 'Control' | 'Meta' | 'Shift'> 
 
 ```typescript
 interface ScreenshotDiff {
-  key: string;                   // e.g., "001-page-load"
+  key: string;                   // e.g., "nav@e0", "cap@e5", "final"
   identical: boolean;
   exceedsThreshold: boolean;
   diffPixels?: number;
@@ -2825,7 +2923,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 - Full `clock.install()` with `pauseAt`/`runFor`/`resume` lifecycle (Playwright >= 1.48)
 - Clock gap patches via `addInitScript()`: `document.timeline.currentTime` (#38951), `MessageChannel` timing
 - HTTP network mocking (targeted per-origin routes via `browserContext.route()`, FIFO queue by method+fullUrl)
-- **Block unrecorded origins** (abort in mock mode)
+- **ResourceType-based mock routing**: mock fetch/XHR, allow document/script/stylesheet/image/font through, abort unrecorded fetch/XHR in mock mode
 - Fresh browser context per session (no localStorage/IndexedDB/cookies bleed)
 - DOM settle detection (Node.js orchestrated polling: MutationObserver flag + `page.waitForTimeout()` real-time polling + font loading + img.complete, 300ms quiescence)
 - Tiered screenshot capture with stabilization loop (two-consecutive-identical)

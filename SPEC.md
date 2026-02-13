@@ -179,7 +179,7 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 
 **Network mocking**: **ResourceType-based routing** — mock only `fetch` and `xhr` resource types (the data layer), allow `document`, `script`, `stylesheet`, `image`, `font`, `media`, `manifest` through to the real server (the rendering layer). This means same-origin API calls (`/api/users`) get mocked while the app's HTML/JS/CSS loads normally from the target URL. Use **origin-correct route patterns** per recorded origin (e.g., `browserContext.route('https://api.stripe.com/**')`) — NOT host-substring globs like `**/api.stripe.com/**` which can overmatch. Avoid catch-all `**/*` (#22338). Route handler checks `request.resourceType()` before matching — if not `fetch`/`xhr`, call `route.continue()`. Always use `browserContext.route()` (survives navigations), not `page.route()`.
 - **Mock mode**: Mock recorded fetch/XHR, abort unrecorded fetch/XHR (`route.abort('connectionrefused')`), allow other resource types through only to **allowed origins** (see below).
-- **Live mode**: No fetch/XHR mocking — all requests pass through to real backend. Optional WS/SSE replay.
+- **Live mode**: No fetch/XHR mocking — requests pass through to real backend. Optional WS/SSE replay. **Egress control**: By default, live mode denies requests to origins not in `replay.allowedOrigins` (prevents malicious PRs from exfiltrating CI secrets or scanning internal networks). Set `replay.allowLiveExternalEgress: true` to explicitly allow unrestricted egress.
 - **Origin remapping** (handles recording at `localhost:3000`, replaying at `ci:3000`): Config `replay.originMap` maps recorded origins to replay origins. Applied uniformly to: (a) route interception patterns, (b) FIFO queue keys, (c) session event URL matching. **Auto-infer**: if `originMap` is empty, the replay engine computes `{ recordedSessionOrigin → targetUrl origin }` automatically. For multi-origin apps (e.g., separate API server), provide explicit mappings: `{ "http://localhost:4000": "http://ci-api:4000" }`. All URL normalization passes through `remapUrl()` which applies the origin map before any matching.
 - **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins non-fetch resources (document, script, image, font) can load from. Default: `[targetUrl origin]` + all origins in `originMap` values. Requests to non-allowed origins for any resource type are aborted with `route.abort('blockedbyclient')`. Prevents malicious PRs from exfiltrating data via modified asset URLs in CI environments.
 - **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
@@ -341,7 +341,7 @@ eyespy sanitize                                   # Strip response bodies for sh
 6. Print summary: `"Approved N screenshots for M sessions. Run 'git add .eyespy/baselines.json && git commit' to persist."`
 7. **Guard**: By default, refuse to approve on non-Docker environments (screenshots may differ from CI). Override with `--force`. Check via `process.env.container === 'docker'` or presence of `/.dockerenv`.
 
-JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 0 = all pass, 1 = diffs detected, 2 = replay failures.
+JSON output when piped (`| jq`), human-friendly TTY output otherwise. Exit code 0 = all pass, 1 = diffs detected, 2 = replay failures. **Mixed outcome precedence**: error (2) > diff (1) > pass (0). If any session has a replay error AND another session has a visual diff, the overall exit code is 2.
 
 **Machine-readable summary** (`eyespy ci` always writes `.eyespy/runs/latest/summary.json`):
 ```json
@@ -414,7 +414,7 @@ Used by CI integrations (PR comments, Slack notifications, dashboards) without p
 eyespy push-baselines              # Upload baseline blobs to remote
 eyespy pull-baselines              # Download baseline blobs from remote
 ```
-Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash), has(hash) }`. Built-in: local filesystem (default), S3-compatible (AWS S3, Cloudflare R2, MinIO, Backblaze B2). Designed following reg-suit's plugin architecture.
+Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash), has(hash) }`. Built-in: local filesystem (default), S3-compatible (AWS S3, Cloudflare R2, MinIO, Backblaze B2). Designed following reg-suit's plugin architecture. **Blob integrity**: On download from remote storage, always hash the received bytes and verify the digest matches the requested key before writing to the local blob store. Reject and retry (up to 2x) on mismatch.
 
 **CI cold start (missing blobs)**: When `baselines.json` exists (git-tracked) but referenced blob files are missing (new developer clone, fresh CI), auto-detect and handle gracefully:
 1. On `eyespy ci` / `eyespy diff`: Check if all hashes in `baselines.json` exist in local blob store
@@ -452,6 +452,7 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "localDiffThreshold": 0.02,
     "originMap": {},
     "allowedOrigins": [],
+    "allowLiveExternalEgress": false,
     "missingBaselinePolicy": "warn"
   },
   "storage": {
@@ -1322,6 +1323,20 @@ async function registerRoutes(
     // e.g. "https://api.stripe.com/**" — NOT "**/api.stripe.com/**" which can overmatch
     await context.route(`${origin}/**`, async (route) => {
       const request = route.request();
+
+      // ResourceType gate: only mock fetch/xhr data requests.
+      // Document, script, stylesheet, image, font, media loads pass through
+      // (subject to allowedOrigins check for SSRF protection).
+      const rt = request.resourceType();
+      if (rt !== 'fetch' && rt !== 'xhr') {
+        if (allowedOrigins.has(new URL(request.url()).origin)) {
+          await route.continue();
+        } else {
+          await route.abort('blockedbyclient'); // SSRF: non-allowed origin
+        }
+        return;
+      }
+
       const normalUrl = normalizeUrl(request.url());
       const urlKey = `${request.method()}:${normalUrl}`;
 
@@ -1647,7 +1662,6 @@ async function replaySession(
   const healingLog: HealingEvent[] = [];
   let failedInteractions = 0;
   let totalInteractions = 0;
-  let screenshotIndex = 1;
   let lastEventTimestamp = 0;
 
   // 6b. URL remapping (recorded origin → replay target origin)
@@ -1667,12 +1681,17 @@ async function replaySession(
   }
 
   await waitForDomSettle(page);
-  screenshots.set(`${pad(screenshotIndex++)}-page-load`, await captureStableScreenshot(page));
+  // Screenshot key uses event-index scheme: nav@e{i}, cap@e{i}, final
+  // Initial navigation is implicitly event index 0
+  screenshots.set('nav@e0', await captureStableScreenshot(page));
 
   // 8. Replay interactions in chronological order
-  const interactions = session.events.filter(e => e.type !== 'network');
+  // Build index map: interaction → original event index in session.events
+  const interactionsWithIndex = session.events
+    .map((e, i) => ({ event: e, eventIndex: i }))
+    .filter(({ event }) => event.type !== 'network');
 
-  for (const event of interactions) {
+  for (const { event, eventIndex } of interactionsWithIndex) {
     // Advance mocked clock to this event's time
     const delta = event.t_ms - lastEventTimestamp;
     if (delta > 0) {
@@ -1699,16 +1718,17 @@ async function replaySession(
     // Wait for DOM to settle
     await waitForDomSettle(page);
 
-    // Tiered screenshot capture
+    // Tiered screenshot capture — key derived from event index
     if (shouldCaptureScreenshot(event, options.screenshotStrategy)) {
       await page.clock.pauseAt(new Date(startTime.getTime() + event.t_ms));
-      screenshots.set(`${pad(screenshotIndex++)}-${event.type}`, await captureStableScreenshot(page));
+      const keyPrefix = event.type === 'navigate' ? 'nav' : 'cap';
+      screenshots.set(`${keyPrefix}@e${eventIndex}`, await captureStableScreenshot(page));
     }
   }
 
-  // 9. Final screenshot (always)
+  // 9. Final screenshot (always) — key is always 'final'
   await page.clock.pauseAt(new Date(startTime.getTime() + lastEventTimestamp));
-  screenshots.set(`${pad(screenshotIndex++)}-end`, await captureStableScreenshot(page));
+  screenshots.set('final', await captureStableScreenshot(page));
 
   // 10. Coverage collection
   let coverage: CoverageBitmap | undefined;
@@ -1878,8 +1898,6 @@ async function deliverPendingMessages(
   }, toTimestamp);
 }
 
-function pad(n: number): string { return String(n).padStart(3, '0'); }
-
 // URL remapping: replace recorded app origin with replay target origin.
 // Initialized by orchestrator caller: remapUrl = createUrlRemapper(session.url, targetUrl);
 // Third-party origins (Stripe, S3, etc.) pass through unchanged.
@@ -1983,21 +2001,23 @@ async function diffScreenshots(
 ): Promise<ScreenshotDiff[]> {
   const results: ScreenshotDiff[] = [];
   for (const [key, buffer] of screenshots) {
-    const currentHash = sha256(buffer);
-    const baselineHash = baselines.getHash(sessionId, key);
+    // Digest of PNG bytes — matches blob store and baseline manifest format
+    const currentDigest = `sha256:${sha256(buffer)}`;
+    const baselineDigest = baselines.getDigest(sessionId, key);
 
-    if (!baselineHash) {
-      results.push({ key, identical: false, exceedsThreshold: false, currentHash, baselineHash: undefined });
+    if (!baselineDigest) {
+      results.push({ key, identical: false, exceedsThreshold: false, currentHash: currentDigest, baselineHash: undefined });
       continue; // New screenshot — no baseline to compare against
     }
 
-    if (currentHash === baselineHash) {
-      results.push({ key, identical: true, exceedsThreshold: false, currentHash, baselineHash });
-      continue; // Hash match — skip pixelmatch
+    if (currentDigest === baselineDigest) {
+      results.push({ key, identical: true, exceedsThreshold: false, currentHash: currentDigest, baselineHash: baselineDigest });
+      continue; // Digest match — skip pixelmatch
     }
 
-    // Hash mismatch — run pixel comparison using Buffers directly (sharp accepts Buffer)
-    const baselineBuffer = await blobStore.get(baselineHash);
+    // Digest mismatch — run pixel comparison using Buffers directly (sharp accepts Buffer)
+    // BlobStore.get() takes raw hex, so strip the sha256: prefix
+    const baselineBuffer = await blobStore.get(baselineDigest.replace('sha256:', ''));
     const diff = await compareScreenshotsFromBuffers(baselineBuffer, buffer, diffOptions);
     results.push({ key, ...diff, currentHash, baselineHash });
   }
@@ -2046,9 +2066,9 @@ async function replayWithRetry(browser: Browser, session: RecordedSession, seed:
     for (const screenshots of retryResults) {
       const shot = screenshots.get(key);
       if (shot) {
-        const baseline = baselines.getHash(session.id, key);
-        const hash = sha256(shot);
-        if (hash !== baseline) diffCount++;
+        const baselineDigest = baselines.getDigest(session.id, key);
+        const currentDigest = `sha256:${sha256(shot)}`;
+        if (currentDigest !== baselineDigest) diffCount++;
       }
     }
     return diffCount >= 2; // 2-of-3 must agree

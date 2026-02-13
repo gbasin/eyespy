@@ -177,11 +177,16 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`. Font loading works correctly with paused clock because: `@font-face` triggers network requests → fulfilled by route handlers (Node.js, real time) → browser font renderer processes data (rendering pipeline, not JS timers) → `document.fonts.ready` resolves. The clock mock only affects JS-level timer APIs, not network completion or rendering.
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
-**Network mocking**: **ResourceType-based routing** — mock only `fetch` and `xhr` resource types (the data layer), allow `document`, `script`, `stylesheet`, `image`, `font`, `media`, `manifest` through to the real server (the rendering layer). This means same-origin API calls (`/api/users`) get mocked while the app's HTML/JS/CSS loads normally from the target URL. Use **origin-correct route patterns** per recorded origin (e.g., `browserContext.route('https://api.stripe.com/**')`) — NOT host-substring globs like `**/api.stripe.com/**` which can overmatch. Avoid catch-all `**/*` (#22338). Route handler checks `request.resourceType()` before matching — if not `fetch`/`xhr`, call `route.continue()`. Always use `browserContext.route()` (survives navigations), not `page.route()`.
-- **Mock mode**: Mock recorded fetch/XHR, abort unrecorded fetch/XHR (`route.abort('connectionrefused')`), allow other resource types through only to **allowed origins** (see below).
-- **Live mode**: No fetch/XHR mocking — requests pass through to real backend. Optional WS/SSE replay. **Egress control**: By default, live mode denies requests to origins not in `replay.allowedOrigins` (prevents malicious PRs from exfiltrating CI secrets or scanning internal networks). Set `replay.allowLiveExternalEgress: true` to explicitly allow unrestricted egress.
+**Network mocking**: Uses a **two-layer routing architecture** to separate egress enforcement from mock fulfillment:
+
+**Layer 1 — Global egress policy** (`browserContext.route('**/*')`): A single catch-all route that ONLY enforces allow/deny decisions. It never fulfills or modifies responses (avoiding catch-all flakiness #22338). If a request's origin is not in the computed `allowedOrigins` set, abort with `blockedbyclient`. Otherwise `route.fallback()` (passes to Layer 2 or the network). This ensures ALL resource types (fetch, xhr, document, image, etc.) are subject to egress control.
+
+**Layer 2 — Mock fulfillment** (per-origin `browserContext.route()`): Narrow origin-correct routes (e.g., `browserContext.route('https://api.stripe.com/**')`) that handle mock mode logic. These routes check `request.resourceType()` — only `fetch`/`xhr` are mocked from recorded FIFO queues; other resource types call `route.continue()`. This is where ResourceType-based routing lives.
+
+- **Mock mode**: Layer 2 fulfills recorded fetch/XHR responses when matched, aborts unrecorded fetch/XHR (`route.abort('connectionrefused')`), and continues other resource types.
+- **Live mode**: Layer 2 is not registered. Layer 1 still enforces egress policy. By default, live mode denies requests to origins not in `replay.allowedOrigins` (prevents malicious PRs from exfiltrating CI secrets or scanning internal networks). Set `replay.allowLiveExternalEgress: true` to explicitly allow unrestricted egress.
 - **Origin remapping** (handles recording at `localhost:3000`, replaying at `ci:3000`): Config `replay.originMap` maps recorded origins to replay origins. Applied uniformly to: (a) route interception patterns, (b) FIFO queue keys, (c) session event URL matching. **Auto-infer**: if `originMap` is empty, the replay engine computes `{ recordedSessionOrigin → targetUrl origin }` automatically. For multi-origin apps (e.g., separate API server), provide explicit mappings: `{ "http://localhost:4000": "http://ci-api:4000" }`. All URL normalization passes through `remapUrl()` which applies the origin map before any matching.
-- **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins non-fetch resources (document, script, image, font) can load from. Default: `[targetUrl origin]` + all origins in `originMap` values. Requests to non-allowed origins for any resource type are aborted with `route.abort('blockedbyclient')`. Prevents malicious PRs from exfiltrating data via modified asset URLs in CI environments.
+- **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins **any request** (fetch, xhr, document, image, font, etc.) can reach. Enforced by the Layer 1 global route. Default: `[targetUrl origin]` + all origins in `originMap` values. Non-allowed origins aborted with `route.abort('blockedbyclient')`.
 - **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
 - **WebSocket mocking**: `page.routeWebSocket()` (Playwright 1.48+). Replay recorded frames in order with timing.
 - **SSE mocking**: Replace `EventSource` via `addInitScript()` with a mock that serves recorded events.
@@ -223,7 +228,10 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - **Capture with stabilization**: After clicks/submits that trigger significant DOM changes. Detection heuristic: MutationObserver within 500ms of the event must see **structural mutations** (childList additions/removals of non-trivial nodes, i.e., elements with children or text content > 10 chars) OR **navigation/route changes**. Attribute-only mutations (class/style changes from focus, hover, `:active`) are excluded — these are cosmetic, not state changes. Form submissions (`<form>` submit event) always trigger capture regardless of DOM mutations.
 - **Skip**: Individual keystrokes mid-input (wait for blur/submit), mouse moves, hovers, scroll events (unless they trigger lazy loading)
 - **Stabilization loop** (Playwright/Chromatic pattern): After dispatching event and waiting for DOM settle, take screenshot A. Wait 100ms. Take screenshot B. If A === B (pixel-identical), use B. If different, repeat (max 5 attempts or 3s timeout). This absorbs remaining compositor/rendering timing variance.
-- **Clock lifecycle per screenshot**: `clock.pauseAt()` before capture (freeze all timers), take stabilized screenshot, `clock.resume()` before next interaction.
+- **Clock lifecycle invariant (normative)**: The clock has exactly two states during replay:
+  1. **Running** — during `clock.runFor(delta)` event advancement AND during DOM settle detection (Node-orchestrated polling uses real wall time; browser timers fire normally).
+  2. **Paused** — only immediately around screenshot capture: `clock.pauseAt()` before stabilization loop, take screenshot(s), then `clock.resume()` before the next interaction.
+  This invariant prevents hangs from browser-timer-freeze during settle while ensuring frozen time for screenshots.
 - Configurable via `screenshotStrategy` in config: `"tiered"` (default), `"every"` (every event), `"manual"` (only explicit `screenshot-marker` events)
 
 **Screenshot key stability** (prevents baseline churn from skipped interactions):
@@ -423,7 +431,11 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
    - `"warn"` (default for local dev): Print warning `"⚠ N baseline blobs missing."`, treat as "new", exit 0.
    - `"fail"`: Exit 2 (`E_BASELINE_MISSING`) — prevents CI from silently passing with missing baselines.
    - Recommended CI config: `"replay": { "missingBaselinePolicy": "fail" }`.
-4. First `eyespy approve` after a fresh clone populates the blob store from current screenshots
+4. **Renderer mismatch detection**: On `eyespy ci` / `eyespy diff`, compare the current Playwright version against `baselines.json`'s `renderer.playwrightVersion`. If they differ, behavior depends on `replay.rendererMismatchPolicy`:
+   - `"warn"` (default): Emit `W_RENDERER_MISMATCH` warning, continue diffing. Diffs are likely spurious but still reported.
+   - `"fail"`: Exit 2 — forces explicit baseline approval before CI passes with a new renderer.
+   - Recommended CI config: `"replay": { "rendererMismatchPolicy": "fail" }` (prevents false diffs from masking real regressions).
+5. First `eyespy approve` after a fresh clone populates the blob store from current screenshots
 
 **Dedup**: All binary artifacts stored by SHA-256 hash. Same screenshot across runs stored once. **Expected savings: 60-80%.**
 
@@ -453,7 +465,8 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "originMap": {},
     "allowedOrigins": [],
     "allowLiveExternalEgress": false,
-    "missingBaselinePolicy": "warn"
+    "missingBaselinePolicy": "warn",
+    "rendererMismatchPolicy": "warn"
   },
   "storage": {
     "backend": "local",
@@ -541,6 +554,7 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `E_BATCH_TOO_LARGE` | Receiver | Event batch exceeds 5MB |
 | `E_RATE_LIMIT` | Receiver | Too many requests |
 | `E_BASELINE_MISSING` | Diff | Baseline blob missing and `missingBaselinePolicy` is `"fail"` |
+| `E_RENDERER_MISMATCH` | Diff | Playwright version differs from baseline renderer and `rendererMismatchPolicy` is `"fail"` |
 
 **Warnings** (logged, don't affect exit code):
 | Code | Context | Description |
@@ -1076,7 +1090,14 @@ type RecordedEvent =
   | { type: 'touchstart'; t_ms: number; selector: SelectorBundle; touches: Touch[] }
   | { type: 'touchmove'; t_ms: number; touches: Touch[] }
   | { type: 'touchend'; t_ms: number; touches: Touch[] }
+  | { type: 'touchcancel'; t_ms: number; touches: Touch[] }
+  | { type: 'pointercancel'; t_ms: number; x: number; y: number; pointerId: number }
+  | { type: 'change'; t_ms: number; selector: SelectorBundle; value: string }
+  | { type: 'submit'; t_ms: number; selector: SelectorBundle }
+  | { type: 'wheel'; t_ms: number; selector: SelectorBundle | null; deltaX: number; deltaY: number }
   | { type: 'dragstart'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { type: 'dragover'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { type: 'dragend'; t_ms: number; selector: SelectorBundle; x: number; y: number }
   | { type: 'drop'; t_ms: number; selector: SelectorBundle; x: number; y: number }
   | { type: 'paste'; t_ms: number; selector: SelectorBundle; text: string }
   | { type: 'copy'; t_ms: number; selector: SelectorBundle }
@@ -1102,8 +1123,8 @@ interface Modifiers {
 }
 
 type NetworkEvent =
-  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; bodyTruncated?: boolean; t_ms: number }
-  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash?: string; bodyTruncated?: boolean; durationMs: number; error?: string }
+  | { type: 'request'; requestId: string; url: string; method: string; headers?: Record<string, string>; body?: string; bodyCapture: 'full' | 'truncated' | 'omitted' | 'error'; t_ms: number }
+  | { type: 'response'; requestId: string; url: string; method: string; status: number; headers?: Record<string, string>; bodyHash?: string; bodyCapture: 'full' | 'truncated' | 'omitted' | 'error'; durationMs: number; error?: string }
   | { type: 'ws-open'; wsId: string; url: string; t_ms: number }
   | { type: 'ws-send'; wsId: string; url: string; data: string; t_ms: number }
   | { type: 'ws-receive'; wsId: string; url: string; data: string; t_ms: number }
@@ -1305,42 +1326,53 @@ function buildNetworkQueues(session: RecordedSession): {
   return { bodyQueues, urlQueues };
 }
 
-// Register routes per origin (NOT catch-all)
+// Two-layer routing architecture:
+// Layer 1: Global egress policy (catch-all, never fulfills — avoids flakiness #22338)
+// Layer 2: Per-origin mock fulfillment (only registered in mock mode)
+
 async function registerRoutes(
   context: BrowserContext,
   queues: { bodyQueues: Map<string, NetworkEvent[]>; urlQueues: Map<string, NetworkEvent[]> },
   mode: 'mock' | 'live',
+  allowedOrigins: Set<string>,
+  allowLiveExternalEgress: boolean,
 ) {
-  // Extract origins from URL queue keys ("METHOD:https://api.stripe.com/v1/charges" → "https://api.stripe.com")
+  // --- Layer 1: Global egress enforcement ---
+  // This route intercepts ALL requests but NEVER fulfills responses.
+  // It only allows or blocks based on origin, then falls back to Layer 2 or the network.
+  await context.route('**/*', async (route) => {
+    const requestOrigin = new URL(route.request().url()).origin;
+    if (allowedOrigins.has(requestOrigin) || allowLiveExternalEgress) {
+      await route.fallback(); // Pass to Layer 2 (if registered) or network
+    } else {
+      await route.abort('blockedbyclient'); // SSRF: non-allowed origin
+    }
+  });
+
+  // --- Layer 2: Mock fulfillment (mock mode only) ---
+  if (mode !== 'mock') return; // Live mode: Layer 1 handles everything
+
   const origins = new Set<string>();
   for (const key of queues.urlQueues.keys()) {
-    const url = key.substring(key.indexOf(':') + 1); // Strip "METHOD:" prefix
+    const url = key.substring(key.indexOf(':') + 1);
     origins.add(new URL(url).origin);
   }
 
   for (const origin of origins) {
-    // Origin-correct pattern: scheme + host, not host-substring glob
-    // e.g. "https://api.stripe.com/**" — NOT "**/api.stripe.com/**" which can overmatch
     await context.route(`${origin}/**`, async (route) => {
       const request = route.request();
 
-      // ResourceType gate: only mock fetch/xhr data requests.
-      // Document, script, stylesheet, image, font, media loads pass through
-      // (subject to allowedOrigins check for SSRF protection).
+      // ResourceType gate: only mock fetch/xhr data requests
       const rt = request.resourceType();
       if (rt !== 'fetch' && rt !== 'xhr') {
-        if (allowedOrigins.has(new URL(request.url()).origin)) {
-          await route.continue();
-        } else {
-          await route.abort('blockedbyclient'); // SSRF: non-allowed origin
-        }
+        await route.continue(); // Non-data resources pass through (already allowed by Layer 1)
         return;
       }
 
       const normalUrl = normalizeUrl(request.url());
       const urlKey = `${request.method()}:${normalUrl}`;
 
-      // Two-tier matching: try body-fingerprinted queue first, fall back to URL-only
+      // Two-tier FIFO matching: body-fingerprinted first, URL-only fallback
       let matched: NetworkEvent | undefined;
 
       if (BODY_METHODS.has(request.method())) {
@@ -1349,7 +1381,6 @@ async function registerRoutes(
         const bodyQueue = queues.bodyQueues.get(bodyKey);
         if (bodyQueue && bodyQueue.length > 0) {
           matched = bodyQueue.shift()!;
-          // Also consume from URL queue to keep them in sync
           const urlQueue = queues.urlQueues.get(urlKey);
           if (urlQueue) {
             const idx = urlQueue.indexOf(matched);
@@ -1358,7 +1389,6 @@ async function registerRoutes(
         }
       }
 
-      // Fallback: URL-only FIFO (for GET/DELETE or when body fingerprint doesn't match)
       if (!matched) {
         const urlQueue = queues.urlQueues.get(urlKey);
         if (urlQueue && urlQueue.length > 0) {
@@ -1368,15 +1398,9 @@ async function registerRoutes(
 
       if (matched) {
         const body = matched.bodyHash ? await blobStore.get(matched.bodyHash) : undefined;
-        await route.fulfill({
-          status: matched.status,
-          headers: matched.headers,
-          body,
-        });
-      } else if (mode === 'mock') {
-        await route.abort('connectionrefused');
+        await route.fulfill({ status: matched.status, headers: matched.headers, body });
       } else {
-        await route.continue(); // Live mode: pass through
+        await route.abort('connectionrefused'); // Unrecorded fetch/xhr in mock mode
       }
     });
   }

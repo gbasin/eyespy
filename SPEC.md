@@ -188,9 +188,8 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Origin remapping** (handles recording at `localhost:3000`, replaying at `ci:3000`): Config `replay.originMap` maps recorded origins to replay origins. Applied uniformly to: (a) route interception patterns, (b) FIFO queue keys, (c) session event URL matching. **Auto-infer**: if `originMap` is empty, the replay engine computes `{ recordedSessionOrigin → targetUrl origin }` automatically. For multi-origin apps (e.g., separate API server), provide explicit mappings: `{ "http://localhost:4000": "http://ci-api:4000" }`. All URL normalization passes through `remapUrl()` which applies the origin map before any matching.
 - **Allowed origins** (SSRF protection in CI): Config `replay.allowedOrigins` restricts which origins **any request** (fetch, xhr, document, image, font, etc.) can reach. Enforced by the Layer 1 global route. Default: `[targetUrl origin]` + all origins in `originMap` values. Non-allowed origins aborted with `route.abort('blockedbyclient')`.
 - **Two-tier FIFO matching**: For GET/DELETE/HEAD: FIFO per `METHOD:normalizedURL`. For POST/PUT/PATCH: first try body-fingerprinted queue (`METHOD:URL:bodyHash`), fall back to URL-only FIFO. This handles concurrent requests to the same endpoint (GraphQL, batch APIs) where arrival order may differ between recording and replay.
-- **WebSocket mocking**: `page.routeWebSocket()` (Playwright 1.48+). Replay recorded frames in order with timing.
-- **SSE mocking**: Replace `EventSource` via `addInitScript()` with a mock that serves recorded events.
-- **CORS preflights**: Cannot intercept (#37245). Document limitation. Mock mode should serve responses without CORS restrictions.
+- **WebSocket/SSE (Phase 1b)**: WS mocking via `page.routeWebSocket()` (Playwright 1.48+), SSE mocking via `addInitScript()` EventSource replacement. **Phase 1a behavior**: WS and SSE connections are blocked (`route.abort()` for WS upgrade requests, EventSource constructor replaced with no-op) and logged as `W_WS_BLOCKED` / `W_SSE_BLOCKED`. This prevents nondeterminism from unmocked real-time connections.
+- **CORS preflights**: If OPTIONS requests are intercepted by Playwright, auto-fulfill with `204` and dynamic `Access-Control-Allow-*` headers based on the request. If the Playwright version does not surface preflights, fail fast with `E_CORS_PREFLIGHT_UNSUPPORTED` when a preflight-dependent request fails in mock mode, and recommend switching that origin to live mode.
 - Never use `waitForLoadState('networkidle')` — hangs on persistent connections.
 - Use `browserContext.route()` (survives full-page navigations) not `page.route()`.
 
@@ -235,14 +234,14 @@ When a CSS selector fails during replay, the engine tries a fallback cascade bef
 - Configurable via `screenshotStrategy` in config: `"tiered"` (default), `"every"` (every event), `"manual"` (only explicit `screenshot-marker` events)
 
 **Screenshot key stability** (prevents baseline churn from skipped interactions):
-Screenshot keys are derived from **event identity** (the event's 0-based index in `session.events`), NOT sequential capture count. This means if an interaction is skipped by auto-healing, later screenshot keys don't shift.
+Screenshot keys are derived from **event `seq`** (the event's monotonic sequence number), NOT sequential capture count or array index. This means if an interaction is skipped by auto-healing, later screenshot keys don't shift. `seq` is canonical — it never changes even if events are re-ordered or gaps exist.
 
-Key format: `{type}@e{eventIndex}` where:
-- `nav@e{i}` — post-navigation capture (after a `navigate` event at index `i`)
-- `cap@e{i}` — capture after an interaction event (click/submit/etc.) at index `i`
+Key format: `{type}@e{seq}` where:
+- `nav@e{seq}` — post-navigation capture (after a `navigate` marker with that `seq`)
+- `cap@e{seq}` — capture after an interaction event (click/submit/etc.) with that `seq`
 - `final` — end-of-session capture (always last)
 
-Example: If events are `[navigate(0), click(1), input(2), click(3), navigate(4)]` and the tiered strategy captures after navigate(0), click(1), click(3), navigate(4), and end-of-session, the keys are: `nav@e0`, `cap@e1`, `cap@e3`, `nav@e4`, `final`. If click(1) is skipped by auto-healing, the remaining keys (`cap@e3`, `nav@e4`, `final`) are unchanged — no renumbering.
+Example: If events are `[navigate(seq=0), click(seq=1), input(seq=2), click(seq=3), navigate(seq=4)]` and the tiered strategy captures after navigate(0), click(1), click(3), navigate(4), and end-of-session, the keys are: `nav@e0`, `cap@e1`, `cap@e3`, `nav@e4`, `final`. If click(1) is skipped by auto-healing, the remaining keys (`cap@e3`, `nav@e4`, `final`) are unchanged — no renumbering.
 
 If a capture point fails (page crash, timeout), the key still exists in the run output as `{ status: "error", error: "..." }` — later keys do not shift.
 
@@ -548,13 +547,14 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `E_ROUTE_MISS` | Replay | Unrecorded fetch/XHR request in mock mode (logged, not fatal per-request) |
 | `E_SESSION_UNREPLAYABLE` | Replay | >30% of interactions failed auto-healing |
 | `E_SCHEMA` | Receiver | Invalid request body |
-| `E_EVENTS_OUT_OF_ORDER` | Receiver | Event batch has non-monotonic `t_ms` values |
+| `E_EVENTS_OUT_OF_ORDER` | Receiver | Event batch has non-contiguous `seq` values or `seq` not sorted ascending |
 | `E_SESSION_EXISTS` | Receiver | Session ID already exists |
 | `E_SESSION_NOT_FOUND` | Receiver | Session ID not found |
 | `E_BATCH_TOO_LARGE` | Receiver | Event batch exceeds 5MB |
 | `E_RATE_LIMIT` | Receiver | Too many requests |
 | `E_BASELINE_MISSING` | Diff | Baseline blob missing and `missingBaselinePolicy` is `"fail"` |
 | `E_RENDERER_MISMATCH` | Diff | Playwright version differs from baseline renderer and `rendererMismatchPolicy` is `"fail"` |
+| `E_CORS_PREFLIGHT_UNSUPPORTED` | Replay | CORS preflight request not interceptable; recommend switching origin to live mode |
 
 **Warnings** (logged, don't affect exit code):
 | Code | Context | Description |
@@ -565,6 +565,8 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `W_BASELINE_MISSING` | Diff | No baseline exists for this screenshot (treated as "new") |
 | `W_RENDERER_MISMATCH` | Diff | Playwright version differs from baseline renderer |
 | `W_STALE_COVERAGE` | Generate | Coverage bitmap sourceContentHash doesn't match current build |
+| `W_WS_BLOCKED` | Replay | WebSocket connection blocked in Phase 1a (not yet supported) |
+| `W_SSE_BLOCKED` | Replay | EventSource connection blocked in Phase 1a (not yet supported) |
 
 ---
 
@@ -1071,39 +1073,43 @@ interface RecordedSession {
   // No separate networkBodies map — body references live on the events themselves.
 }
 
-// All t_ms values are milliseconds from session start (offset, NOT epoch).
-// Epoch timestamps MUST NOT appear in stored session events.
+// Every event has:
+//   seq: monotonically increasing integer (0-based). Canonical ordering field.
+//        t_ms may collide (same millisecond); seq never does. Screenshot keys,
+//        receiver validation, and event identity all use seq.
+//   t_ms: milliseconds from session start (offset, NOT epoch).
+//        Epoch timestamps MUST NOT appear in stored session events.
 type RecordedEvent =
-  | { type: 'click'; t_ms: number; selector: SelectorBundle; x: number; y: number; button: number; modifiers: Modifiers }
-  | { type: 'dblclick'; t_ms: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'input'; t_ms: number; selector: SelectorBundle; value: string; inputType?: string }
-  | { type: 'keydown'; t_ms: number; key: string; code: string; modifiers: Modifiers }
-  | { type: 'keyup'; t_ms: number; key: string; code: string }
-  | { type: 'scroll'; t_ms: number; selector: SelectorBundle | null; x: number; y: number }
-  | { type: 'navigate'; t_ms: number; url: string; navigationType: 'push' | 'replace' | 'popstate' }
-  | { type: 'resize'; t_ms: number; width: number; height: number }
-  | { type: 'focus'; t_ms: number; selector: SelectorBundle }
-  | { type: 'blur'; t_ms: number; selector: SelectorBundle }
-  | { type: 'pointerdown'; t_ms: number; selector: SelectorBundle; x: number; y: number; pointerId: number }
-  | { type: 'pointermove'; t_ms: number; x: number; y: number; pointerId: number }
-  | { type: 'pointerup'; t_ms: number; x: number; y: number; pointerId: number }
-  | { type: 'touchstart'; t_ms: number; selector: SelectorBundle; touches: Touch[] }
-  | { type: 'touchmove'; t_ms: number; touches: Touch[] }
-  | { type: 'touchend'; t_ms: number; touches: Touch[] }
-  | { type: 'touchcancel'; t_ms: number; touches: Touch[] }
-  | { type: 'pointercancel'; t_ms: number; x: number; y: number; pointerId: number }
-  | { type: 'change'; t_ms: number; selector: SelectorBundle; value: string }
-  | { type: 'submit'; t_ms: number; selector: SelectorBundle }
-  | { type: 'wheel'; t_ms: number; selector: SelectorBundle | null; deltaX: number; deltaY: number }
-  | { type: 'dragstart'; t_ms: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'dragover'; t_ms: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'dragend'; t_ms: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'drop'; t_ms: number; selector: SelectorBundle; x: number; y: number }
-  | { type: 'paste'; t_ms: number; selector: SelectorBundle; text: string }
-  | { type: 'copy'; t_ms: number; selector: SelectorBundle }
-  | { type: 'cut'; t_ms: number; selector: SelectorBundle }
-  | { type: 'network'; t_ms: number; event: NetworkEvent }
-  | { type: 'screenshot-marker'; t_ms: number; label: string };
+  | { seq: number; type: 'click'; t_ms: number; selector: SelectorBundle; x: number; y: number; button: number; modifiers: Modifiers }
+  | { seq: number; type: 'dblclick'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { seq: number; type: 'input'; t_ms: number; selector: SelectorBundle; value: string; inputType?: string }
+  | { seq: number; type: 'keydown'; t_ms: number; key: string; code: string; modifiers: Modifiers; replay?: boolean }
+  | { seq: number; type: 'keyup'; t_ms: number; key: string; code: string; replay?: boolean }
+  | { seq: number; type: 'scroll'; t_ms: number; selector: SelectorBundle | null; x: number; y: number }
+  | { seq: number; type: 'navigate'; t_ms: number; url: string; navigationType: 'load' | 'push' | 'replace' | 'popstate' }
+  | { seq: number; type: 'resize'; t_ms: number; width: number; height: number }
+  | { seq: number; type: 'focus'; t_ms: number; selector: SelectorBundle }
+  | { seq: number; type: 'blur'; t_ms: number; selector: SelectorBundle }
+  | { seq: number; type: 'pointerdown'; t_ms: number; selector: SelectorBundle; x: number; y: number; pointerId: number }
+  | { seq: number; type: 'pointermove'; t_ms: number; x: number; y: number; pointerId: number }
+  | { seq: number; type: 'pointerup'; t_ms: number; x: number; y: number; pointerId: number }
+  | { seq: number; type: 'touchstart'; t_ms: number; selector: SelectorBundle; touches: Touch[] }
+  | { seq: number; type: 'touchmove'; t_ms: number; touches: Touch[] }
+  | { seq: number; type: 'touchend'; t_ms: number; touches: Touch[] }
+  | { seq: number; type: 'touchcancel'; t_ms: number; touches: Touch[] }
+  | { seq: number; type: 'pointercancel'; t_ms: number; x: number; y: number; pointerId: number }
+  | { seq: number; type: 'change'; t_ms: number; selector: SelectorBundle; value: string }
+  | { seq: number; type: 'submit'; t_ms: number; selector: SelectorBundle }
+  | { seq: number; type: 'wheel'; t_ms: number; selector: SelectorBundle | null; deltaX: number; deltaY: number }
+  | { seq: number; type: 'dragstart'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { seq: number; type: 'dragover'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { seq: number; type: 'dragend'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { seq: number; type: 'drop'; t_ms: number; selector: SelectorBundle; x: number; y: number }
+  | { seq: number; type: 'paste'; t_ms: number; selector: SelectorBundle; text: string }
+  | { seq: number; type: 'copy'; t_ms: number; selector: SelectorBundle }
+  | { seq: number; type: 'cut'; t_ms: number; selector: SelectorBundle }
+  | { seq: number; type: 'network'; t_ms: number; event: NetworkEvent }
+  | { seq: number; type: 'screenshot-marker'; t_ms: number; label: string };
 
 interface SelectorBundle {
   primary: string;               // Best selector (data-testid > id > role > css path)
@@ -1656,11 +1662,11 @@ async function replaySession(
   await context.addInitScript(SSE_MOCK_SCRIPT, extractSseRecordings(session));
 
   // 3. Network mocking — register routes on context (survives navigations)
-  //    Note: FIFO queue keys use RECORDED URLs (not remapped). Route handlers intercept
-  //    requests to the RECORDED origins. When the app makes requests to third-party APIs
-  //    (Stripe, S3), those URLs are the same in recording and replay. The app origin
-  //    routes are NOT intercepted — those go to the real replay server at targetUrl.
-  //    Only third-party API traffic flows through the mock.
+  //    In mock mode, ALL recorded origins are mocked (both same-origin API calls and
+  //    third-party APIs like Stripe/S3). FIFO queue keys use RECORDED URLs, and route
+  //    handlers intercept ALL origins that appear in the recording. URL remapping
+  //    (originMap) translates recorded frontend origin → replay target origin so that
+  //    same-origin API requests match correctly.
   const networkQueues = buildNetworkQueues(session);
   await registerRoutes(context, networkQueues, options.mode);
 
@@ -1705,17 +1711,16 @@ async function replaySession(
   }
 
   await waitForDomSettle(page);
-  // Screenshot key uses event-index scheme: nav@e{i}, cap@e{i}, final
-  // Initial navigation is implicitly event index 0
+  // Screenshot key uses event seq: nav@e{seq}, cap@e{seq}, final
+  // Initial navigation marker is always seq=0
   screenshots.set('nav@e0', await captureStableScreenshot(page));
 
-  // 8. Replay interactions in chronological order
-  // Build index map: interaction → original event index in session.events
-  const interactionsWithIndex = session.events
-    .map((e, i) => ({ event: e, eventIndex: i }))
-    .filter(({ event }) => event.type !== 'network');
+  // 8. Replay interactions in chronological order (sorted by seq)
+  const interactions = session.events
+    .filter(event => event.type !== 'network')
+    .sort((a, b) => a.seq - b.seq);
 
-  for (const { event, eventIndex } of interactionsWithIndex) {
+  for (const event of interactions) {
     // Advance mocked clock to this event's time
     const delta = event.t_ms - lastEventTimestamp;
     if (delta > 0) {
@@ -1742,11 +1747,11 @@ async function replaySession(
     // Wait for DOM to settle
     await waitForDomSettle(page);
 
-    // Tiered screenshot capture — key derived from event index
+    // Tiered screenshot capture — key derived from event seq
     if (shouldCaptureScreenshot(event, options.screenshotStrategy)) {
       await page.clock.pauseAt(new Date(startTime.getTime() + event.t_ms));
       const keyPrefix = event.type === 'navigate' ? 'nav' : 'cap';
-      screenshots.set(`${keyPrefix}@e${eventIndex}`, await captureStableScreenshot(page));
+      screenshots.set(`${keyPrefix}@e${event.seq}`, await captureStableScreenshot(page));
     }
   }
 
@@ -1802,10 +1807,13 @@ async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog:
       break;
     }
     case 'keydown':
-      await page.keyboard.down(event.key);
+      // Key events are NOT replayed by default — text entry is handled by 'input' via
+      // locator.fill(). Replaying both would double-type. Only replay key events marked
+      // with replay:true (non-text keys, shortcuts like Ctrl+S, Escape, Tab, arrows).
+      if (event.replay) await page.keyboard.down(event.key);
       break;
     case 'keyup':
-      await page.keyboard.up(event.key);
+      if (event.replay) await page.keyboard.up(event.key);
       break;
     case 'scroll': {
       if (event.selector) {
@@ -1817,9 +1825,15 @@ async function dispatchInteraction(page: Page, event: RecordedEvent, healingLog:
       break;
     }
     case 'navigate':
-      // Apply URL remapping: replace recorded app origin with replay target origin.
-      // Third-party URLs (Stripe, etc.) are unchanged. See Open Question 6.
-      await page.goto(remapUrl(event.url), { waitUntil: 'commit', timeout: 30000 });
+      // Navigate events are MARKERS, not replay actions. In SPAs, a prior click/submit
+      // already triggered the route change; calling page.goto() would hard-navigate and
+      // reset state. Instead, optionally wait for the expected URL to confirm the app
+      // reached the right route, then capture a screenshot.
+      try {
+        await page.waitForURL(remapUrl(event.url), { timeout: 5000 });
+      } catch {
+        // URL didn't match — log warning but continue (app may use different URL format)
+      }
       break;
     // ... dblclick, focus, blur, pointer, touch, drag, paste, copy, cut follow same pattern
   }
@@ -2084,18 +2098,22 @@ async function replayWithRetry(browser: Browser, session: RecordedSession, seed:
     if (retry.status === 'success') retryResults.push(retry.screenshots);
   }
 
-  // Majority vote: diff must appear in 2-of-3 attempts to count
+  // Majority vote: diff must appear in 2-of-3 attempts to count.
+  // IMPORTANT: Confirm by pixel threshold, NOT digest comparison. PNG metadata/encoding
+  // variance can cause digest mismatches even when the pixel diff is under threshold.
   const confirmedDiffs = diffedKeys.filter(key => {
-    let diffCount = 1; // First attempt already showed diff
+    let diffCount = 1; // First attempt already showed diff (by pixel threshold)
     for (const screenshots of retryResults) {
       const shot = screenshots.get(key);
       if (shot) {
         const baselineDigest = baselines.getDigest(session.id, key);
-        const currentDigest = `sha256:${sha256(shot)}`;
-        if (currentDigest !== baselineDigest) diffCount++;
+        if (!baselineDigest) { diffCount++; continue; }
+        const baselineBuffer = blobStore.get(baselineDigest.replace('sha256:', ''));
+        const retryDiff = compareScreenshotsFromBuffers(baselineBuffer, shot, diffOptions);
+        if (retryDiff.exceedsThreshold) diffCount++;
       }
     }
-    return diffCount >= 2; // 2-of-3 must agree
+    return diffCount >= 2; // 2-of-3 must exceed pixel threshold
   });
 
   return { ...first, confirmedDiffs, totalAttempts: 1 + retryResults.length };
@@ -2131,7 +2149,14 @@ function shouldCaptureScreenshot(event: RecordedEvent, strategy: string): boolea
     case 'copy':            return false; // No visual change
     case 'cut':             return true;  // Content removal
     case 'dragstart':       return false; // Wait for drop
+    case 'dragover':        return false;
+    case 'dragend':         return false;
     case 'drop':            return true;  // Content change
+    case 'change':          return true;  // Form value committed
+    case 'submit':          return true;  // Form submission
+    case 'wheel':           return false; // Scroll variant
+    case 'touchcancel':     return false;
+    case 'pointercancel':   return false;
     case 'screenshot-marker': return true;
     default:                return false;
   }
@@ -2603,6 +2628,8 @@ Use `junit-report-builder` npm package. GitLab requires `<testsuites>` wrapper (
 4. Images as `data:image/png;base64,...` data URLs
 
 Four viewer modes: side-by-side, slider (CSS `clip-path`), blend (opacity crossfade), toggle (click to switch).
+
+**Security**: All session-derived strings (session IDs, file names, error messages) MUST be HTML-escaped before injection into the report template. The report MUST include a restrictive CSP meta tag (`<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' data:; script-src 'unsafe-inline'">`) to prevent execution of any external scripts. This protects against XSS if session data contains malicious content.
 
 **Size warning**: Base64 inflates images ~33%. 50 screenshots at 200KB each = 13MB HTML. For suites over 30 screenshots, default to folder-based report with separate image files, standalone HTML as opt-in (`--inline-report`).
 
@@ -3088,8 +3115,8 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 | **Clock install/pauseAt race (#33926)** | P0 | Between `clock.install({ time: T })` and `clock.pauseAt(T)`, the clock runs. If both use the same time, `pauseAt` can fail with "Cannot fast-forward to the past." Fix: install 1s before target time. Already applied in orchestrator code. |
 | **Compositor flag effectiveness (without `--deterministic-mode`)** | P0 | `--deterministic-mode` is UNUSABLE — it enables `--enable-begin-frame-control` which hangs `page.screenshot()` ([#31829](https://github.com/microsoft/playwright/issues/31829)). We use the 6 individual compositor flags instead. Phase 0 PoC validates that these alone produce stable screenshots. Chromatic proves this approach works at scale (7.3B+ tests, vanilla Chrome, no BeginFrame control). |
 | **Baseline blob availability (team sharing)** | P1 | `baselines.json` manifest is git-tracked but actual PNGs are in local blob store (gitignored). Teams need `eyespy pull-baselines` before first CI run. Document onboarding. Remote storage (S3/R2) is pluggable. |
-| **catch-all route causes flakiness (#22338)** | P0 | Targeted per-origin routes, not `**/*`. |
-| **CORS preflights bypass routes (#37245)** | P0 | Document limitation. Playwright auto-fulfills OPTIONS with 204 when interception active. |
+| **catch-all route causes flakiness (#22338)** | P0 | #22338 applies to catch-all *fulfill* routes. Our Layer 1 catch-all (`**/*`) only calls `route.fallback()` or `route.abort()`, never `route.fulfill()` — this is safe. Layer 2 uses targeted per-origin routes for mock fulfillment. |
+| **CORS preflights bypass routes (#37245)** | P0 | If OPTIONS preflights are intercepted, auto-fulfill with 204 + dynamic Allow headers. If Playwright doesn't surface them, fail fast with `E_CORS_PREFLIGHT_UNSUPPORTED` and recommend live mode for that origin. |
 | **Network mock miss (request not in recording)** | P0 | Log diagnostic, abort request in mock mode. Fuzzy URL matching (Phase 1b) for timestamp/nonce params. Report all misses in run summary. |
 | **Selector breakage during replay** | P0 | Auto-healing cascade (9 strategies). Basic healing (strategies 1-5) in Phase 1a. Full cascade + healing overlay in Phase 1b. 30% skip threshold aborts session. |
 | **Navigation timeout (30s)** | P0 | Capture diagnostic screenshot, log pending network requests, mark as replay-error (exit code 2), skip to next session. |

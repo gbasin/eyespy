@@ -177,7 +177,7 @@ Replays recorded sessions in headless Chromium with deterministic environment.
 - **Font loading gate**: Wait for `document.fonts.ready` AND `document.fonts.status === 'loaded'`. Font loading works correctly with paused clock because: `@font-face` triggers network requests → fulfilled by route handlers (Node.js, real time) → browser font renderer processes data (rendering pipeline, not JS timers) → `document.fonts.ready` resolves. The clock mock only affects JS-level timer APIs, not network completion or rendering.
 - **Docker mandatory**: Mandate official Playwright Docker image for CI. Document that local replays may differ from CI.
 
-**Network mocking**: **ResourceType-based routing** — mock only `fetch` and `xhr` resource types (the data layer), allow `document`, `script`, `stylesheet`, `image`, `font`, `media`, `manifest` through to the real server (the rendering layer). This means same-origin API calls (`/api/users`) get mocked while the app's HTML/JS/CSS loads normally from the target URL. Use **targeted route patterns** per recorded origin (e.g., `page.route('**/api.stripe.com/**')`) instead of catch-all `**/*`. Catch-all introduces flakiness (#22338). Route handler checks `request.resourceType()` before matching — if not `fetch`/`xhr`, call `route.continue()`.
+**Network mocking**: **ResourceType-based routing** — mock only `fetch` and `xhr` resource types (the data layer), allow `document`, `script`, `stylesheet`, `image`, `font`, `media`, `manifest` through to the real server (the rendering layer). This means same-origin API calls (`/api/users`) get mocked while the app's HTML/JS/CSS loads normally from the target URL. Use **origin-correct route patterns** per recorded origin (e.g., `browserContext.route('https://api.stripe.com/**')`) — NOT host-substring globs like `**/api.stripe.com/**` which can overmatch. Avoid catch-all `**/*` (#22338). Route handler checks `request.resourceType()` before matching — if not `fetch`/`xhr`, call `route.continue()`. Always use `browserContext.route()` (survives navigations), not `page.route()`.
 - **Mock mode**: Mock recorded fetch/XHR, abort unrecorded fetch/XHR (`route.abort('connectionrefused')`), allow other resource types through only to **allowed origins** (see below).
 - **Live mode**: No fetch/XHR mocking — all requests pass through to real backend. Optional WS/SSE replay.
 - **Origin remapping** (handles recording at `localhost:3000`, replaying at `ci:3000`): Config `replay.originMap` maps recorded origins to replay origins. Applied uniformly to: (a) route interception patterns, (b) FIFO queue keys, (c) session event URL matching. **Auto-infer**: if `originMap` is empty, the replay engine computes `{ recordedSessionOrigin → targetUrl origin }` automatically. For multi-origin apps (e.g., separate API server), provide explicit mappings: `{ "http://localhost:4000": "http://ci-api:4000" }`. All URL normalization passes through `remapUrl()` which applies the origin map before any matching.
@@ -288,8 +288,8 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 ### 4. Visual Diff Engine
 
 - pixelmatch with configurable tolerance (`threshold`, `maxDiffPixels`, `maxDiffPixelRatio`)
-- Anti-aliasing detection ON by default
-- **Dimension check**: If baseline and current screenshots differ in dimensions, report as error (not diff). Likely means viewport changed or scrollbar appeared. Don't attempt resize — the mismatch itself is the signal.
+- Anti-aliasing detection ON by default (`ignoreAntialiasing: true` in config — AA pixels excluded from diff counts)
+- **Dimension check**: If baseline and current screenshots differ in dimensions, report as `E_DIMENSION_MISMATCH` (exit code 2, NOT exit code 1 — this is a tooling/config error, not a visual diff). Likely means viewport changed or scrollbar appeared. Don't attempt resize — the mismatch itself is the signal.
 - Region masking: rectangles or CSS selectors for dynamic content (timestamps, ads, avatars) **(Phase 1b)**
 - Content-hash short-circuit: SHA-256 hash screenshot before diffing. If hash matches baseline, skip pixelmatch entirely.
 - Three-panel output: expected | actual | diff (red pixels)
@@ -419,9 +419,11 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
 **CI cold start (missing blobs)**: When `baselines.json` exists (git-tracked) but referenced blob files are missing (new developer clone, fresh CI), auto-detect and handle gracefully:
 1. On `eyespy ci` / `eyespy diff`: Check if all hashes in `baselines.json` exist in local blob store
 2. **If remote storage is configured**: Auto-pull missing blobs before diffing (`eyespy ci` implicitly runs `pull-baselines` for any missing hashes). Print `"Pulling N missing baseline blobs from remote..."`. This is the expected CI flow — no manual step needed.
-3. If no remote configured and blobs missing: print warning `"⚠ N baseline blobs missing. Configure remote storage or run 'eyespy approve' to establish local baselines. Treating all screenshots as new."`
-4. Treat unresolvable screenshots as "new" (no diff possible), exit 0 (not exit 1 — missing blobs aren't a regression)
-5. First `eyespy approve` after a fresh clone populates the blob store from current screenshots
+3. If no remote configured and blobs missing: behavior depends on `replay.missingBaselinePolicy`:
+   - `"warn"` (default for local dev): Print warning `"⚠ N baseline blobs missing."`, treat as "new", exit 0.
+   - `"fail"`: Exit 2 (`E_BASELINE_MISSING`) — prevents CI from silently passing with missing baselines.
+   - Recommended CI config: `"replay": { "missingBaselinePolicy": "fail" }`.
+4. First `eyespy approve` after a fresh clone populates the blob store from current screenshots
 
 **Dedup**: All binary artifacts stored by SHA-256 hash. Same screenshot across runs stored once. **Expected savings: 60-80%.**
 
@@ -435,7 +437,7 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
   "diff": {
     "threshold": 0.1,
     "maxDiffPixelRatio": 0.005,
-    "includeAA": false
+    "ignoreAntialiasing": true
   },
   "replay": {
     "screenshotStrategy": "tiered",
@@ -449,7 +451,8 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "seed": "default",
     "localDiffThreshold": 0.02,
     "originMap": {},
-    "allowedOrigins": []
+    "allowedOrigins": [],
+    "missingBaselinePolicy": "warn"
   },
   "storage": {
     "backend": "local",
@@ -495,12 +498,12 @@ Local HTTP server for ingesting SDK recordings. **Not a production service** —
 - Response 201: `{ "sessionId": "uuid" }`
 - Errors: `400 E_SCHEMA`, `409 E_SESSION_EXISTS`
 
-`POST /v1/sessions/{sessionId}/events` — Ingest event batch
-- Headers: `Content-Type: application/json`, optional `Content-Encoding: gzip`
-- Request: `{ "events": [RecordedEvent...] }`
+`POST /v1/sessions/{sessionId}/events` — Ingest event batch (at-least-once delivery)
+- Headers: `Content-Type: application/json`, optional `Content-Encoding: gzip`, **`Idempotency-Key: <uuid>` (required)** — receiver deduplicates by storing last 100 keys per session for 24h. Duplicate key → return same 202 without re-appending.
+- Request: `{ "events": [RecordedEvent...], "sequence": { "start": N, "end": M } }` — events within a batch MUST be non-decreasing by `t_ms`; receiver rejects otherwise (`400 E_EVENTS_OUT_OF_ORDER`). Gaps in sequence between batches are allowed; `finish` validates overall monotonicity.
 - Response 202: `{ "accepted": true, "eventCount": N }`
 - Receiver: validates schema, appends to `.eyespy/sessions/.incoming/{sessionId}/`, extracts large bodies to blob store
-- Errors: `400 E_SCHEMA`, `413 E_BATCH_TOO_LARGE` (> 5MB), `429 E_RATE_LIMIT`
+- Errors: `400 E_SCHEMA`, `400 E_EVENTS_OUT_OF_ORDER`, `413 E_BATCH_TOO_LARGE` (> 5MB), `429 E_RATE_LIMIT`
 
 `POST /v1/sessions/{sessionId}/finish` — Finalize session
 - Request: `{ "endedAt": "ISO-8601" }`
@@ -531,10 +534,12 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `E_ROUTE_MISS` | Replay | Unrecorded fetch/XHR request in mock mode (logged, not fatal per-request) |
 | `E_SESSION_UNREPLAYABLE` | Replay | >30% of interactions failed auto-healing |
 | `E_SCHEMA` | Receiver | Invalid request body |
+| `E_EVENTS_OUT_OF_ORDER` | Receiver | Event batch has non-monotonic `t_ms` values |
 | `E_SESSION_EXISTS` | Receiver | Session ID already exists |
 | `E_SESSION_NOT_FOUND` | Receiver | Session ID not found |
 | `E_BATCH_TOO_LARGE` | Receiver | Event batch exceeds 5MB |
 | `E_RATE_LIMIT` | Receiver | Too many requests |
+| `E_BASELINE_MISSING` | Diff | Baseline blob missing and `missingBaselinePolicy` is `"fail"` |
 
 **Warnings** (logged, don't affect exit code):
 | Code | Context | Description |
@@ -1127,9 +1132,9 @@ interface HealingEvent {
 /** Wraps baselines.json for ergonomic lookup */
 interface BaselineManifest {
   version: number;
-  baselines: Record<string, Record<string, { hash: string; width: number; height: number }>>;
-  getHash(sessionId: string, screenshotKey: string): string | undefined;
-  setHash(sessionId: string, screenshotKey: string, hash: string, width: number, height: number): void;
+  baselines: Record<string, Record<string, { digest: string; width: number; height: number }>>;
+  getDigest(sessionId: string, screenshotKey: string): string | undefined;
+  setDigest(sessionId: string, screenshotKey: string, digest: string, width: number, height: number): void;
 }
 
 /** Maps branch index → source location for session skipping */
@@ -1313,8 +1318,9 @@ async function registerRoutes(
   }
 
   for (const origin of origins) {
-    // Targeted pattern: only intercept this specific origin
-    await context.route(`**/${new URL(origin).host}/**`, async (route) => {
+    // Origin-correct pattern: scheme + host, not host-substring glob
+    // e.g. "https://api.stripe.com/**" — NOT "**/api.stripe.com/**" which can overmatch
+    await context.route(`${origin}/**`, async (route) => {
       const request = route.request();
       const normalUrl = normalizeUrl(request.url());
       const urlKey = `${request.method()}:${normalUrl}`;
@@ -2317,24 +2323,32 @@ async function compareScreenshots(
     threshold?: number;          // 0.0 - 1.0, default 0.1 (YIQ color distance)
     maxDiffPixelRatio?: number;  // e.g. 0.01 = 1% of pixels
     maxDiffPixels?: number;
-    includeAA?: boolean;         // Include anti-aliased pixels, default false
+    ignoreAntialiasing?: boolean; // Ignore anti-aliased pixel diffs, default true
     maskRegions?: Array<{ x: number; y: number; width: number; height: number }>;
   } = {}
 ): Promise<DiffResult> {
-  const { threshold = 0.1, maxDiffPixelRatio = 0.005, includeAA = false } = options;
+  // ignoreAntialiasing maps to pixelmatch's inverted `includeAA` option:
+  // ignoreAntialiasing: true → includeAA: false (detect AA, exclude from diff count)
+  const { threshold = 0.1, maxDiffPixelRatio = 0.005, ignoreAntialiasing = true } = options;
+  const includeAA = !ignoreAntialiasing;
 
-  // Read both images
-  const [baselineBuffer, currentBuffer] = await Promise.all([
-    sharp(baselinePath).raw().ensureAlpha().toBuffer({ resolveWithObject: true }),
-    sharp(currentPath).raw().ensureAlpha().toBuffer({ resolveWithObject: true }),
+  // Content-hash short-circuit: hash PNG bytes (NOT decoded RGBA) for consistency
+  // with blob store digests and baseline manifest. All digests are of encoded PNG bytes.
+  const [baselinePng, currentPng] = await Promise.all([
+    readFile(baselinePath),
+    readFile(currentPath),
   ]);
-
-  // Content-hash short-circuit
-  const baselineHash = crypto.createHash('sha256').update(baselineBuffer.data).digest('hex');
-  const currentHash = crypto.createHash('sha256').update(currentBuffer.data).digest('hex');
+  const baselineHash = crypto.createHash('sha256').update(baselinePng).digest('hex');
+  const currentHash = crypto.createHash('sha256').update(currentPng).digest('hex');
   if (baselineHash === currentHash) {
     return { identical: true, diffPixels: 0, diffRatio: 0, exceedsThreshold: false, baselineHash, currentHash };
   }
+
+  // Decode to raw RGBA for pixel comparison
+  const [baselineBuffer, currentBuffer] = await Promise.all([
+    sharp(baselinePng).raw().ensureAlpha().toBuffer({ resolveWithObject: true }),
+    sharp(currentPng).raw().ensureAlpha().toBuffer({ resolveWithObject: true }),
+  ]);
 
   const { width, height } = baselineBuffer.info;
   const totalPixels = width * height;

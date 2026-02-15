@@ -276,6 +276,12 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 
 **Resource constraints**: Chrome uses 3-20GB RAM per instance. Default concurrency: `Math.min(2, Math.floor(os.totalmem() / 5GB))`. Hard timeout: 120s per session replay, 30s per navigation.
 
+**Concurrent session replay orchestration**: Replay uses a **shared Browser instance** with **separate BrowserContexts per session** (one worker per context). This provides memory efficiency (one Chromium process, shared GPU/V8 baseline) while maintaining isolation (each BrowserContext has independent cookies, localStorage, IndexedDB, network routes, and PRNG seeds). Worker pool size = `concurrency` setting.
+
+- **BrowserContext-per-session**: `browser.newContext()` per replay. Each context gets its own `addInitScript()` PRNG injection, `clock.install()`, and `browserContext.route()` network mocks. Contexts are fully isolated — no state leaks.
+- **OOM protection**: Monitor `process.memoryUsage().rss`. If RSS exceeds 80% of `os.totalmem()`, pause worker pool, close idle contexts. If a browser crashes (detected via `browser.on('disconnected')`), restart the Browser instance and resume remaining sessions. Max 3 browser restarts per `eyespy ci` run; after 3, fail with `E_BROWSER_UNSTABLE`.
+- **Parallel coverage collection** (`eyespy generate`): Same shared-Browser, BrowserContext-per-session orchestration. Coverage sessions are independent (no diff comparison needed), so concurrency can be higher. Add `generate.concurrency` config (default: `Math.min(4, cpuCount)`). Sessions with valid, non-stale bitmaps (`sourceContentHash` matches) are skipped entirely (incremental mode).
+
 ### 3. Test Generator (Coverage-Based Selection)
 
 **Algorithm**:
@@ -291,6 +297,8 @@ This means the retry function signature is: `replaySession(session, seed) → sc
 - On replay against new code: if `sourceContentHash` differs, re-collect coverage and update bitmap (self-healing). If same hash, bitmap is still valid even with a different git SHA.
 - If >50% of sessions are stale and unreplayable, fall back to "replay all"
 - Coverage-guided session skipping (TurboSnap equivalent): only replay sessions whose bitmaps overlap with files changed in the current diff. 80%+ time savings.
+
+**Parallel coverage collection**: `eyespy generate` uses the same shared-Browser, BrowserContext-per-session orchestration as replay (see "Concurrent session replay orchestration" above). Coverage collection is embarrassingly parallel — each session replays independently with V8 coverage ON. Sessions with valid, non-stale bitmaps (`sourceContentHash` matches current build) are skipped entirely (incremental mode), further reducing generate time on subsequent runs. Concurrency is configurable via `generate.concurrency` (default: `Math.min(4, cpuCount)`).
 
 **File storage** (CLI-first):
 - `.eyespy/coverage/` — bitmap files per session, keyed by session ID
@@ -471,7 +479,7 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
     "mode": "mock",
     "viewport": { "width": 1280, "height": 720 },
     "seed": "default",
-    "localDiffThreshold": 0.02,
+    "localDiffThreshold": 0.02,   // maxDiffPixelRatio override for non-Docker/local runs (--local flag). Lenient because local rendering differs from CI Docker.
     "originMap": {},
     "allowedOrigins": [],
     "originPolicies": {},
@@ -499,6 +507,10 @@ Pluggable storage interface: `StorageBackend { upload(hash, data), download(hash
   "report": {
     "format": "html",
     "inlineThreshold": 30
+  },
+  "generate": {
+    "concurrency": "auto",
+    "stylePatterns": ["**/*.css", "**/*.scss", "**/*.less", "**/*.sass", "**/*.styl", "**/*.pcss"]
   }
 }
 ```
@@ -576,6 +588,7 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `E_BASELINE_MISSING` | Diff | Baseline blob missing and `missingBaselinePolicy` is `"fail"` |
 | `E_RENDERER_MISMATCH` | Diff | Playwright version differs from baseline renderer and `rendererMismatchPolicy` is `"fail"` |
 | `E_CORS_PREFLIGHT_UNSUPPORTED` | Replay | CORS preflight request not interceptable; recommend switching origin to live mode |
+| `E_BROWSER_UNSTABLE` | Replay | Browser crashed 3+ times during a single `eyespy ci` run; aborting |
 
 **Warnings** (logged, don't affect exit code):
 | Code | Context | Description |
@@ -590,6 +603,7 @@ Machine-readable error/warning codes used in `summary.json`, receiver responses,
 | `W_STALE_COVERAGE` | Generate | Coverage bitmap sourceContentHash doesn't match current build |
 | `W_WS_BLOCKED` | Replay | WebSocket connection blocked in Phase 1a (not yet supported) |
 | `W_SSE_BLOCKED` | Replay | EventSource connection blocked in Phase 1a (not yet supported) |
+| `W_CSS_CHANGE_REPLAY_ALL` | Generate | CSS/style file changed in diff — forcing replay of all sessions (V8 coverage cannot scope CSS impact) |
 
 ---
 
@@ -1084,6 +1098,7 @@ async function startRecording(page: Page, blobStore: BlobStore): Promise<Recorde
 interface RecordedSession {
   formatVersion: 1;              // Schema version — reject with clear error if mismatch
   id: string;                    // UUID v4
+  name?: string;                 // Optional human-readable label (e.g. "checkout flow", "login happy path")
   startedAt: string;             // ISO 8601 — absolute wall-clock time of session start
   endedAt: string;
   url: string;                   // Starting URL
@@ -2371,13 +2386,13 @@ function popcount8(n: number): number {
 function getAffectedSessions(
   changedFiles: string[],       // From `git diff --name-only HEAD~1`
   bitmaps: CoverageBitmap[],
-  sourceMap: Map<string, string> // scriptUrl → local file path
+  sourceMap: Map<string, string[]> // scriptUrl → local file paths (one-to-many: bundled files map multiple source files to one script URL)
 ): { replay: string[]; skip: string[] } {
   // Map changed files to script URLs
   const changedScripts = new Set<string>();
   for (const file of changedFiles) {
-    for (const [scriptUrl, localPath] of sourceMap) {
-      if (localPath.endsWith(file) || file.endsWith(localPath)) {
+    for (const [scriptUrl, localPaths] of sourceMap) {
+      if (localPaths.some(p => p.endsWith(file) || file.endsWith(p))) {
         changedScripts.add(scriptUrl);
       }
     }
@@ -2410,6 +2425,24 @@ function getAffectedSessions(
   return { replay, skip };
 }
 ```
+
+**CSS-only change detection**: V8 coverage is invisible to CSS changes — `.css`, `.scss`, `.less`, `.sass`, `.styl`, `.pcss` files are never executed by V8, so they produce no coverage bitmaps. When `getAffectedSessions()` detects that `changedFiles` includes **any** style file (matched by extension), it **forces replay-all** — all sessions are added to the `replay` set regardless of bitmap overlap. This is conservative but correct: CSS changes can affect any component's visual output, and there's no way to scope the impact without a CSS dependency graph (which is out of scope).
+
+```typescript
+// Pre-check in getAffectedSessions(), before bitmap analysis:
+const STYLE_EXTENSIONS = /\.(css|scss|less|sass|styl|pcss)$/;
+const hasStyleChanges = changedFiles.some(f => STYLE_EXTENSIONS.test(f));
+if (hasStyleChanges) {
+  // CSS changes are invisible to V8 coverage — force replay-all
+  return {
+    replay: bitmaps.map(b => b.sessionId),
+    skip: [],
+    warning: 'W_CSS_CHANGE_REPLAY_ALL',
+  };
+}
+```
+
+The style file extensions can be customized via `generate.stylePatterns` in config (default: `["**/*.css", "**/*.scss", "**/*.less", "**/*.sass", "**/*.styl", "**/*.pcss"]`). This allows teams using CSS Modules, Tailwind, or other patterns to fine-tune which file changes trigger a full replay.
 
 ### Diff Engine: pixelmatch Integration
 
@@ -2996,7 +3029,7 @@ Set `resetOnNavigation: false` to accumulate coverage across SPA navigations wit
 
 ## Build Sequence
 
-### Phase 0: Proof of Concept (2-3 days, 1 developer)
+### Phase 0: Proof of Concept
 
 **Goal**: Validate that deterministic replay produces pixel-identical screenshots across 5+ app archetypes that stress different aspects of the determinism stack.
 
@@ -3048,7 +3081,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 
 ---
 
-### Phase 1a: MVP (3-4 weeks, 1-2 developers)
+### Phase 1a: MVP
 
 **Goal**: `npx eyespy record --url <url>` → `npx eyespy ci --url <url>` → HTML diff report.
 
@@ -3078,7 +3111,9 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 - *Diff engine*: pixelmatch + sharp integration, SHA-256 hash shortcircuit, dimension check (error if mismatch), HTML report with base64-inlined images (inline for <= 30 screenshots, folder-based for > 30).
 
 **Week 4: CLI Integration + CI**
-- CLI commands: `init`, `record`, `replay`, `diff`, `approve`, `ci`, `status`, `push-baselines`, `pull-baselines`
+- CLI commands: `init`, `record`, `replay`, `diff`, `approve`, `ci`, `status`, `list`, `push-baselines`, `pull-baselines`
+- `eyespy record --name "checkout flow"` — optional `--name` flag stores human-readable label in `RecordedSession.name`
+- `eyespy list` — lists all recorded sessions (`id`, `name`, `url`, `captureMethod`, `startedAt`, event count). Supports `--json` for machine-readable output.
 - Exit codes 0/1/2
 - JSON output when piped (`!process.stdout.isTTY`)
 - Progress bars (cli-progress) + spinners (ora), suppressed in JSON mode
@@ -3089,7 +3124,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 
 ---
 
-### Phase 1b: Feature Completion (3-4 weeks, 2 developers)
+### Phase 1b: Feature Completion
 
 **Goal**: Meticulous parity — coverage-based test selection, SDK recording, WS/SSE, dedup.
 
@@ -3126,7 +3161,7 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 
 ---
 
-### Phase 2: Server + Dashboard + GitHub + Storybook (6-8 weeks)
+### Phase 2: Server + Dashboard + GitHub + Storybook
 
 - **Storybook integration**: `eyespy storybook` command — connects to Storybook's test runner, treats each story as a recording session (navigate to story → screenshot). Leverages coverage-based pruning to skip unchanged stories. Competes directly with Chromatic's TurboSnap but local-first and free. Integration architecture: use `@storybook/test-runner` (Playwright-based) as a peer dependency, inject Eyespy's determinism stack into the test runner's browser context.
 - Fastify REST API with GitHub OAuth + RBAC
@@ -3252,7 +3287,7 @@ Playwright already has visual regression testing. Why would anyone use Eyespy?
 - **Moat**: Coverage-based test selection is the real differentiator. "Record once, auto-select minimal test suite, skip unaffected sessions" is a workflow Playwright can't replicate without building a test generation engine.
 
 **Threat 2: Meticulous open-sourcing**
-Meticulous could open-source their core (unlikely — VC-funded, $12M raised) or a competitor could clone their approach.
+Meticulous could open-source their core (unlikely — VC-funded, ~$4M raised, ~$1M ARR as of 2024) or a competitor could clone their approach.
 - **If Meticulous open-sources**: They have a custom Chromium fork for determinism. We use vanilla Playwright. Their approach is more robust for determinism but harder to maintain. We'd compete on "no custom browser" simplicity.
 - **If another startup enters**: First-mover in open-source matters. Having a working CLI with `npm install` adoption before a competitor launches is the moat.
 - **Moat**: MIT license + CLI-first (no server required) + coverage-based selection. The combination doesn't exist.

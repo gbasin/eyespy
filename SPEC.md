@@ -1,5 +1,9 @@
 # Eyespy: Open-Source Visual Regression Testing Platform
 
+**Date:** 2026-02-12 (last updated 2026-02-15)
+**Author:** Gary Basin
+**Status:** In Review
+
 ## Context
 
 Frontend teams ship visual regressions because their testing tools are inadequate. Meticulous AI solved this with: record real user sessions, replay deterministically, diff screenshots, use V8 coverage to select a minimal test suite. But it's closed-source, cloud-only, and expensive.
@@ -7,6 +11,40 @@ Frontend teams ship visual regressions because their testing tools are inadequat
 No open-source alternative provides the full pipeline. Lost Pixel, Argos CI, and Pixeleye do visual regression but require manually-written tests. Nobody has recording + coverage-based test selection + deterministic replay + visual diffing in open source.
 
 **License**: MIT. Maximum adoption.
+
+---
+
+## Goals
+
+- **Full Meticulous parity in open source**: Record real user sessions, replay deterministically, diff screenshots, and use V8 coverage for coverage-based test selection — the complete pipeline that no open-source tool currently provides
+- **CLI-first, no server required for V1**: Deliver a working product via `npm install` with local manifest + blob store; defer server/dashboard/GitHub integration to Phase 2
+- **"Good enough" determinism without forking Chromium**: Achieve >= 98% replay determinism using Playwright's anti-flake stack + pixel tolerance + smart retry, avoiding the maintenance burden of a custom browser fork
+- **Coverage-based test selection as the key differentiator**: Auto-generate tests from recorded sessions and use greedy set cover to select minimal test suites (< 20% selection ratio with >= 70% coverage), separating Eyespy from "yet another screenshot diffing tool"
+- **Zero-friction recording for developers**: Make `npx eyespy record` → `npx eyespy ci` → HTML report take < 15 minutes, with both Playwright recorder and script tag SDK (Phase 1b) to eliminate manual test writing
+- **Local-first wedge against cloud competitors**: Enable self-hosted visual regression testing for teams that can't use Chromatic/Applitools/Percy (fintech, healthcare, government), with optional remote blob sync for team sharing
+- **Fast CI turnaround with session skipping**: Deliver < 5 min runs for 20-session suites by skipping sessions whose covered code hasn't changed since baseline
+- **MIT license for maximum adoption**: Remove barriers to enterprise use and enable the open-source ecosystem to build on top of Eyespy
+
+---
+
+## Non-Goals
+
+**Architecture & Core Approach:**
+- No Chromium fork — "good enough" determinism via Playwright anti-flake stack + pixel tolerance
+- No AI exploration agent — record/replay focused only
+- No DOM mutation recording — capture clickstream + network only, not full DOM snapshots
+- No ES6 Proxy for network interception — direct monkey-patching (SDK) for performance
+- No Istanbul format coverage conversion — straight to bitmaps from V8
+
+**Browser Capabilities (Scoped Out):**
+- No cross-origin iframe recording/replay — same-origin iframes supported, cross-origin invisible
+- No WebGL determinism — document limitation, mask canvas regions in diffs
+- No PWAs/Service Workers — blocked during replay (`serviceWorkers: 'block'`)
+- No Web Worker PRNG seeding — `addInitScript()` main-page only; workers get real random values
+- No closed Shadow DOM visibility — open shadow roots supported via event bubbling
+- No streaming/chunked response replay — buffered to string (`route.fulfill()` limitation)
+- No body redaction — breaks replay; strip sensitive headers only
+- No subresource recording in SDK — SDK captures fetch/XHR only, not `<img>`/`<link>`/`<script>`
 
 ---
 
@@ -106,6 +144,111 @@ Phase 2: Server + Dashboard (Docker)
   │      │  │ Webhooks     │
   └──────┘  └──────────────┘
 ```
+
+---
+
+## Data Flow
+
+### 1. Recording Flow
+
+```
+User Interaction
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  Recording Source (2 paths)                         │
+│                                                      │
+│  Path A: SDK (Browser)          Path B: Playwright  │
+│    │                                   │             │
+│    ├─ Event capture (clicks, etc.)    ├─ Event via │
+│    ├─ Network monkey-patch            │   addInit   │
+│    │  (fetch/XHR/WS/SSE)              │   Script()  │
+│    ├─ Selector generation             ├─ Network   │
+│    │  (testid > id > role > CSS)      │   via page  │
+│    │                                   │   .on()     │
+│    └─ Transport to receiver           └─ Direct     │
+│        (batch 50 events / 5s)             write     │
+│                                                      │
+└───────────┬──────────────────────┬───────────────────┘
+            │                      │
+            ▼                      ▼
+    POST /v1/sessions        Direct File Write
+    (Receiver API)
+            │                      │
+            └──────────┬───────────┘
+                       ▼
+            .eyespy/sessions/<id>.json
+                       │
+                       ├─ events[] (interactions + seq + t_ms)
+                       ├─ network[] (BodyRef → blobs/)
+                       └─ observedOrigins[] (Playwright only)
+
+            .eyespy/blobs/<sha256>
+                       │
+                       └─ Request/response bodies (content-addressable)
+```
+
+Both recording paths converge on the same `RecordedSession` JSON format. The SDK captures events in the browser and sends them to a receiver API (Phase 1b), which validates sequence ordering, deduplicates via idempotency keys, and extracts large bodies to the blob store. The Playwright recorder writes directly to disk. All network bodies are stored content-addressably by SHA-256 hash, enabling automatic deduplication across sessions. The session JSON contains only metadata and references (BodyRef) — the actual payload bytes live in `blobs/`.
+
+### 2. Replay + Diff Flow
+
+```
+.eyespy/sessions/<id>.json + .eyespy/blobs/
+            │
+            ▼
+┌─────────────────────────────────────────────────────┐
+│  Replay Engine (Playwright + Determinism Stack)    │
+│                                                      │
+│  ┌─────────────────────────────────────────────┐   │
+│  │ Fresh BrowserContext per session            │   │
+│  │   │                                          │   │
+│  │   ├─ PRNG injection (addInitScript)         │   │
+│  │   │  └─ Math.random, crypto.randomUUID      │   │
+│  │   ├─ clock.install() + clock gap patches    │   │
+│  │   │  └─ Date, timers, document.timeline     │   │
+│  │   ├─ Network mocking (two-layer routing)    │   │
+│  │   │  └─ FIFO queues (method:url:body)       │   │
+│  │   └─ Anti-flake: compositor flags + CSS     │   │
+│  └─────────────────────────────────────────────┘   │
+│            │                                         │
+│            ▼                                         │
+│  Event Replay Loop                                  │
+│    │                                                 │
+│    ├─ For each event: clock.runFor(delta)           │
+│    ├─ Dispatch interaction (click/input/etc.)       │
+│    ├─ DOM settle (Node.js polling + fonts)          │
+│    ├─ clock.pauseAt() → screenshot → clock.resume() │
+│    └─ Auto-healing if selector fails (5 strategies) │
+│                                                      │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+      .eyespy/runs/<id>/screenshots/
+                  │
+                  ├─ nav@e0, cap@e5, final (seq-keyed)
+                  └─ Stored as SHA-256 → blobs/
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│  Diff Engine                                        │
+│    │                                                 │
+│    ├─ Load baselines.json (manifest)                │
+│    ├─ For each screenshot:                          │
+│    │   ├─ SHA-256 hash shortcircuit (match → skip)  │
+│    │   ├─ Dimension check (error if mismatch)       │
+│    │   └─ pixelmatch with tolerance                 │
+│    ├─ Smart retry: re-confirm diffs 2x (majority)   │
+│    └─ Generate HTML report (3-panel viewer)         │
+│                                                      │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+         .eyespy/runs/<id>/report.html
+                  │
+                  └─ Exit code: 0=pass, 1=diff, 2=error
+```
+
+The replay engine creates a fresh `BrowserContext` per session to avoid state bleed. It injects deterministic PRNG and clock mocks before any page JavaScript runs, then rebuilds FIFO network queues from the recorded session data. During replay, the clock advances by exact time deltas between events (`clock.runFor(delta)`), ensuring timers fire deterministically. After each interaction, Node.js orchestrates DOM settle detection using real wall-clock polling (the browser clock remains running during settle, frozen only for screenshots). The diff engine compares captured screenshots against baselines using content-hash shortcuts and pixel-level comparison. Smart retry re-confirms visual differences to eliminate false positives, creating fresh contexts and rebuilding FIFO queues for each retry attempt.
 
 ---
 
@@ -670,6 +813,73 @@ eyespy/
 ├── pnpm-workspace.yaml
 └── biome.json
 ```
+
+---
+
+## Architecture Constraints
+
+AI agents are the primary maintainers. Mechanical enforcement is mandatory.
+
+### Layered Dependency Rules
+
+```
+┌─────────────┐
+│ @eyespy/cli │ (root: can import all)
+└──────┬──────┘
+       │
+   ┌───┴───┬────────┬────────┐
+   │       │        │        │
+   v       v        v        v
+┌─────┐ ┌────┐ ┌────┐ ┌──────┐
+│ sdk │ │ re │ │ de │ │ tg   │ (middle tier: import shared only)
+└──┬──┘ └─┬──┘ └─┬──┘ └───┬──┘
+   │      │      │        │
+   └──────┴──────┴────────┘
+          │
+          v
+    ┌──────────┐
+    │  shared  │ (leaf: imports nothing)
+    └──────────┘
+
+re=replay-engine, de=diff-engine, tg=test-generator
+```
+
+**Allowed imports:**
+- `@eyespy/shared`: none
+- `@eyespy/recorder-sdk`: `@eyespy/shared` only
+- `@eyespy/replay-engine`: `@eyespy/shared` only
+- `@eyespy/diff-engine`: `@eyespy/shared` only
+- `@eyespy/test-generator`: `@eyespy/shared` only
+- `@eyespy/cli`: all packages
+
+**Enforcement:** ESLint `no-restricted-imports` in each package + `eslint-plugin-import/no-restricted-paths`.
+
+### Boundary Validation
+
+**Principle:** Validate at system boundaries. Trust internal code.
+
+**Validation points (Zod):**
+1. Session JSON loaded from disk (`.eyespy/sessions/<sid>.json`)
+2. Config JSON (`.eyespy/config.json`)
+3. CLI args (Commander already validates flags; Zod for subcommand file args)
+4. Receiver API request bodies (Phase 1b)
+5. Remote storage responses (Phase 2)
+
+**No validation:**
+- Internal function calls (TypeScript types only)
+- In-memory session objects passed between packages
+
+### Structural Tests
+
+**Package-level invariants (`packages/*/test/structure.test.ts`):**
+1. **No circular deps:** `madge --circular packages/*/src`
+2. **Shared isolation:** `grep -r "from '@eyespy/(?!shared)" packages/shared/src` returns empty
+3. **SDK bundle size:** `gzip -c dist/recorder.js | wc -c` < 18432 bytes (18KB)
+4. **No console.log in libs:** `grep -r "console\\.log" packages/{shared,recorder-sdk,replay-engine,diff-engine,test-generator}/src` returns empty (CLI is exempt)
+5. **Error code coverage:** Every code in `shared/src/errors/registry.ts` has a test file matching `test/**/*.test.ts` that throws it
+6. **Session round-trip:** `JSON.parse(JSON.stringify(session))` deep-equals original for all fixtures in `test/fixtures/sessions/*.json`
+
+**CI enforcement:** Run on every PR. Block merge on failure.
 
 ---
 
@@ -3235,6 +3445,130 @@ The PoC is a single test harness (`proof-of-concept.ts`, ~500 lines) that runs a
 
 ---
 
+## Security Considerations
+
+### Session Data Sensitivity
+
+Eyespy records comprehensive user interaction data including:
+- **Network traffic**: Full HTTP/HTTPS request/response pairs (URL, method, headers, bodies) for `fetch`, `XMLHttpRequest`, `WebSocket` frames, and `EventSource` events
+- **User actions**: All DOM interactions (clicks, keystrokes, form inputs, drags, gestures) with element selectors and modifier keys
+- **Navigation history**: Complete URL sequences including query parameters and fragments
+- **Page state**: Screenshots captured at navigation points and after significant interactions
+
+Recorded sessions are stored unencrypted in `.eyespy/sessions/<session-id>.json` with network response bodies in the content-addressable blob store (`.eyespy/blobs/`). **Sessions may contain PII, credentials, API keys, or business-critical data.** Do not commit sessions to version control (`.eyespy/sessions/` and `.eyespy/blobs/` are gitignored by default).
+
+### Header Stripping
+
+The SDK and Playwright recorder **automatically strip sensitive headers** from recorded network traffic:
+- `Authorization` (Bearer tokens, Basic auth)
+- `Cookie` (session cookies, auth tokens)
+- `Set-Cookie` (prevents cookie replay attacks)
+
+Configurable via `recording.sensitiveHeaders` in `.eyespy/config.json`. Custom headers (e.g., `X-API-Key`, `X-CSRF-Token`) must be added explicitly.
+
+**No body redaction**: Request/response bodies are captured intact. Redaction would break deterministic replay (POST body fingerprints are used for FIFO queue matching). Use `excludePaths` to block recording of sensitive endpoints (e.g., `/login`, `/checkout`, `/api/payment`).
+
+### Body Capture Limits
+
+Network bodies are truncated to prevent storage explosion and reduce exposure:
+- **SDK (browser)**: Default `maxBodyBytes: 262144` (256KB)
+- **Playwright recorder**: Default 1MB
+- Bodies exceeding limit are truncated with `bodyTruncated: true` flag in session JSON
+- Blob store itself has **no size limit** — configurable limits apply only at capture time
+
+### Storage Security
+
+**No encryption at rest**. All artifacts stored as plaintext:
+- Session JSON files (`.eyespy/sessions/`)
+- Network bodies and screenshots (`.eyespy/blobs/`, SHA-256 content-addressable)
+- Coverage bitmaps (`.eyespy/coverage/`)
+
+`.eyespy/` directory permissions inherit from filesystem. On shared developer machines or CI runners with persistent storage, verify directory permissions prevent unauthorized access.
+
+**Remote storage** (S3/R2 for baseline sharing): Credentials stored in environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) or passed via CLI flags. No credential caching. Use IAM roles or scoped bucket policies to limit blast radius.
+
+### Production Recording Safeguards
+
+**Phase 1b only** (SDK not in Phase 1a MVP). Prevent accidental production recording:
+
+1. **`allowedHosts` allowlist**: SDK only records on explicitly permitted origins. Defaults to empty (0% sampling for unknown hosts).
+2. **Default sampling: 0%**: Must opt-in per environment.
+3. **Production kill switch**: `data-no-record` attribute and configurable `excludePaths` for sensitive routes.
+4. **Mutation throttle**: If DOM mutation rate exceeds 10,000 mutations/10s (Sentry pattern), SDK emits `recording-stopped` event and halts to prevent runaway memory consumption.
+
+### Session Sanitization
+
+**`eyespy sanitize` command** (Phase 1b): Strips network response bodies from recorded sessions to enable safe sharing with external parties (contractors, support teams, issue reporters). Preserves request metadata (URL, method, headers) and interaction events for debugging UI behavior without exposing sensitive data.
+
+Output: sanitized session JSON with `bodyDigest` references only (blobs not included). Replay will fail (network bodies required for deterministic replay), but session is safe to attach to public bug reports.
+
+### Authentication
+
+**Phase 1a (MVP)**: No authentication. CLI is local-only. `eyespy record --listen` receiver requires `X-Eyespy-Token` header (auto-generated token printed to terminal on startup, or provided via `--token` / `EYESPY_TOKEN` env var). `--no-auth` flag disables token validation (discouraged).
+
+**Phase 2 (server + dashboard)**: GitHub OAuth + RBAC. Baseline approval actions logged with GitHub user identity. No local filesystem access — all operations via REST API.
+
+### CI/Sharing Risks
+
+**Blobs may contain sensitive data**:
+- Network response bodies: API responses, user data, internal IDs
+- Screenshots: Usernames, email addresses, account balances, PII visible in UI
+- Session metadata: Internal URLs, API endpoint structure
+
+**Mitigation**:
+1. Use test accounts with synthetic data during recording
+2. Never record against production databases
+3. `.eyespy/blobs/` is gitignored — verify `.gitignore` exists before first commit
+4. GitHub Actions artifacts are **private by default** (org members only), but can be set public. Set `actions: read` permission to `none` or verify artifact retention policy
+5. Remote blob storage (S3/R2): Use private buckets with IAM policies restricting access to CI service accounts only
+
+---
+
+## Operational Concerns
+
+### Logging
+
+**Stdout/stderr contract**:
+- **stdout**: Reserved for JSON output when `--json` flag is used or output is piped (`!process.stdout.isTTY`). Human-formatted otherwise.
+- **stderr**: All diagnostic logs, progress bars (cli-progress), spinners (ora). Suppressed when `--json` or piped.
+
+**Structured logging**:
+- Internal format: `{ level, timestamp, runId, sessionId?, message, data? }`
+- Written as formatted text to stderr in TTY mode
+- **Correlation IDs**: Every log line includes `runId`. Per-session logs include `sessionId`. Network events include `requestId`.
+
+**Verbosity**:
+- **Default**: High-level progress (session replay status, diff results, errors)
+- **`--verbose`**: Debug-level logs — route matching decisions, healing attempts + confidence scores, stabilization loop iteration count, clock lifecycle transitions, FIFO queue hits/misses
+
+**Machine-readable summary**: `eyespy ci` always writes `.eyespy/runs/latest/summary.json`. Used by CI integrations (PR comments, Slack notifications, dashboards) without parsing CLI text output.
+
+### Error Reporting
+
+**Exit codes**:
+- `0` = All sessions passed
+- `1` = Visual diffs detected (no replay errors)
+- `2` = Replay errors (navigation timeout, browser crash, blob missing, schema errors)
+- **Precedence**: error (2) > diff (1) > pass (0). Mixed outcomes use highest code.
+
+**Error code registry** (see Error Code Registry section):
+- **Errors** (`E_xxx`): Cause exit code 2. Logged in `summary.json` per-session errors array.
+- **Warnings** (`W_xxx`): Logged in `summary.json` per-session warnings array. Don't affect exit code.
+
+**Diagnostic screenshots**: On navigation timeout (`E_NAV_TIMEOUT`) or session timeout (`E_SESSION_TIMEOUT`), capture diagnostic screenshot + log pending network requests. Store in `.eyespy/runs/<run-id>/diagnostics/`.
+
+### Monitoring
+
+**Key metrics** (tracked via `summary.json`):
+1. **False positive rate**: `(confirmRetries / totalDiffs)` — smart retry eliminates transient diffs. Target: < 5%. High rate indicates non-determinism issues.
+2. **Replay time**: `summary.json`'s `totals.durationMs`. Track p50/p95/p99. Target: < 10s per session for typical SPAs.
+3. **Storage size**: `.eyespy/blobs/` directory size. Dedup should keep size sublinear relative to total screenshots.
+4. **Error rate**: `(sessions with status="error") / totalSessions`. Frequent errors indicate app-breaking changes or mock staleness.
+5. **Healing rate**: `W_HEALING_USED` warning count. High rate indicates selector fragility — consider `data-testid` attributes.
+6. **Baseline staleness**: Days since last `eyespy approve`. Stale baselines (>90d) may indicate abandoned sessions.
+
+---
+
 ## Existential Risks (What Kills This Project)
 
 These are not P0/P1 implementation risks — they're strategic risks that could make the entire product concept unviable.
@@ -3322,6 +3656,233 @@ These tools use AI/ML for "visual AI" diffing instead of pixel comparison. Smart
 
 ---
 
+## E2E User Flows & Test Infrastructure
+
+### Part 1: User Stories (Product Flows)
+
+**US-01: First-time setup + record**
+1. Developer runs `npx eyespy record --url http://localhost:3000`
+2. Eyespy auto-creates `.eyespy/` directory with `config.json`, `sessions/`, `blobs/`, `baselines/`
+3. Playwright browser opens showing target URL
+4. Developer interacts with app (clicks, types, navigates 3 pages)
+5. Developer stops recording (Ctrl+C or overlay button)
+6. Session saved to `.eyespy/sessions/<uuid>.json` with 12 actions
+7. Blobs stored in `.eyespy/blobs/<hash>` (screenshots, network bodies)
+**Validates**: CLI init, Playwright recorder, session serialization, blob storage, config generation
+
+**US-02: Replay + establish baselines**
+1. Developer runs `npx eyespy replay --session <id>` (no prior baselines exist)
+2. Docker container starts (Chromium 131, Ubuntu 22.04)
+3. Eyespy replays 12 actions with network mocks
+4. Visual snapshots taken at 3 key states
+5. Baselines written to `.eyespy/baselines/<session>/<hash>.png`
+6. Report shows "baseline established" status, 100% success
+**Validates**: Docker replay, network mocking, baseline generation, report output
+
+**US-03: Detect visual diff**
+1. Developer changes CSS: `.button { margin: 20px }` → `.button { margin: 25px }`
+2. Run `npx eyespy replay --all`
+3. Replay detects 1px shift in button position
+4. Report shows diff image (red overlay), pixel difference metric (0.03% pixels changed)
+5. Exit code 1 (failure)
+**Validates**: Visual diffing, threshold enforcement, failure reporting
+
+**US-04: Approve new baselines**
+1. Developer reviews report from US-03 diff
+2. Runs `npx eyespy approve --session <id>`
+3. Current screenshots replace baselines in `.eyespy/baselines/`
+4. Re-running replay now passes
+**Validates**: Baseline approval workflow, idempotent replays
+
+**US-05: CI pipeline**
+1. GitHub Actions clones repo
+2. Pulls baselines from R2: `npx eyespy baseline pull`
+3. Runs `npx eyespy replay --all --strict`
+4. Strict mode uses Docker + 0.01% threshold
+5. Report uploaded to R2 as HTML artifact
+6. Exit code 0 (pass) or 1 (fail) determines PR status
+**Validates**: Remote baseline sync, strict mode, CI integration, exit codes
+
+**US-06: Smart retry (transient diff eliminated)**
+1. First replay attempt: animation mid-frame causes 2% diff
+2. Eyespy auto-retries after 500ms (up to 3 attempts)
+3. Second attempt: animation settled, diff 0.005%
+4. Report shows "passed on retry 2/3"
+**Validates**: Retry logic, animation stabilization, pass thresholds
+
+**US-07: Auto-healing (selector fallback)**
+1. Session recorded with `data-testid="submit-btn"`
+2. Developer refactors: removes data-testid, adds `id="submitBtn"`
+3. Replay attempts primary selector (fails)
+4. Fallback cascade: tries `button:has-text("Submit")` → succeeds
+5. Report shows "healed selector" warning
+**Validates**: Selector fallback, resilience, warning reporting
+
+**US-08: Network mock miss (abort)**
+1. Session recorded without API call to `/api/profile`
+2. Developer adds new fetch to `/api/profile` in app code
+3. Replay intercepts request, no mock found
+4. Replay aborts with error: "Unmocked request: /api/profile"
+5. Report includes diagnostic: request URL, headers, timestamp
+**Validates**: Network request coverage, fail-fast on unmocked requests
+
+**US-09: Navigation timeout recovery**
+1. Replay navigates to `/slow-page` (server hangs)
+2. After 30s timeout, navigation fails
+3. Eyespy captures diagnostic screenshot at timeout moment
+4. Skips remaining actions in page context
+5. Report shows "navigation timeout" with screenshot, continues to next independent action
+**Validates**: Timeout handling, diagnostic capture, partial session completion
+
+**US-10: Multiple sessions (aggregate report)**
+1. Developer records 5 sessions (login, checkout, profile, admin, search)
+2. Runs `npx eyespy replay --all`
+3. Replays run in parallel (worker pool size 4)
+4. Aggregate report shows 5/5 passed, 1m 23s total time
+5. Report includes session summaries, coverage map
+**Validates**: Parallel replay, aggregate reporting, session management
+
+**US-11: Local dev mode**
+1. Developer runs `npx eyespy replay --local`
+2. Skips Docker (uses local Chromium)
+3. Lenient thresholds: 0.5% pixel diff allowed
+4. Fast feedback loop (no container startup delay)
+**Validates**: Local mode, threshold configuration, dev UX
+
+**US-12: SDK recording (Phase 1b)**
+1. Developer embeds `<script src="eyespy-sdk.js">` in app
+2. Navigates to app, clicks 8 times
+3. SDK POSTs events to `http://localhost:8765/record`
+4. Receiver service writes session to `.eyespy/sessions/<id>.json`
+5. Session includes DOM snapshots, network logs, computed styles
+**Validates**: Browser SDK, receiver service, SDK-to-session serialization
+
+**US-13: Coverage-based test selection (Phase 1b)**
+1. Developer records 20 sessions covering entire app
+2. Runs `npx eyespy generate --coverage`
+3. Eyespy analyzes code coverage per session
+4. Generates minimal suite: 6 sessions covering 95% of routes + components
+5. Output: `test-suite.json` with selected session IDs
+**Validates**: Coverage analysis, test minimization, suite generation
+
+**US-14: Session skipping (Phase 1b)**
+1. Developer changes `Button.tsx` (git diff detected)
+2. Runs `npx eyespy replay --smart`
+3. Eyespy skips 14/20 sessions (no Button.tsx coverage)
+4. Replays only 6 relevant sessions
+5. Report shows "14 skipped, 6 replayed"
+**Validates**: Git diff analysis, session filtering, fast feedback
+
+**US-15: Remote baseline sync**
+1. Developer runs `npx eyespy baseline push`
+2. Baselines uploaded to R2: `.eyespy/baselines/**/*.png` → `s3://bucket/project/baselines/`
+3. CI runs `npx eyespy baseline pull` before replay
+4. Deterministic Docker ensures baseline matching
+**Validates**: S3/R2 integration, baseline sync, determinism
+
+**US-16: Playwright version upgrade**
+1. Eyespy updates Playwright 1.48 → 1.49 (Chromium 131 → 132)
+2. Developer runs `npx eyespy replay --all`
+3. All baselines fail (font rendering changed)
+4. Developer runs `npx eyespy approve --all --reset-chromium`
+5. Baselines regenerated with new Chromium version
+6. Report annotated with "baseline reset due to Playwright upgrade"
+**Validates**: Version change handling, bulk baseline reset, documentation
+
+### Part 2: Test Infrastructure
+
+#### Test Applications
+
+**Core Apps** (deterministic, minimal dependencies):
+- **TodoMVC React 18** (`tests/apps/todomvc-react`): Add/delete todos, filter, routing. Known diffs: change button color, swap to Vue build.
+- **CSS-in-JS App** (`tests/apps/css-in-js`): Styled-components with theme toggle. Diff: dark mode toggle breaks.
+- **Form Validation** (`tests/apps/form-app`): Email/password with client-side validation. Diff: regex change causes error message shift.
+- **MUI DataGrid** (`tests/apps/mui-grid`): Sortable 100-row table. Diff: column width change.
+- **Date Picker** (`tests/apps/date-picker`): react-datepicker with locale switching. Diff: switch EN → FR locale.
+
+**Advanced Apps** (Phase 1b):
+- **Next.js 14 App** (`tests/apps/nextjs-app`): SSR, API routes, dynamic imports. Diff: page load order changes.
+- **Randomness-Heavy Page** (`tests/apps/random-app`): `Math.random()` shuffles card order. Validates replay determinism.
+- **Canvas/WebGL App** (`tests/apps/canvas-app`): Three.js animation. Validates canvas snapshot diffing.
+
+**API Fixtures**:
+- Mock server (`tests/fixtures/mock-api`) with canned responses for deterministic replay.
+
+#### Test Fixtures
+
+**Pre-recorded Sessions** (`tests/fixtures/sessions/`):
+- `golden-login.json`: 7 actions, 2 pages, 12KB session file
+- `broken-selectors.json`: Intentionally outdated selectors for healing tests
+- `network-miss.json`: Missing `/api/v2/user` body for mock-miss test
+- `corrupt-session.json`: Malformed JSON for error handling tests
+
+**Known-Good Baselines** (`tests/fixtures/baselines/`):
+- Generated in Docker (Ubuntu 22.04, Chromium 131)
+- Versioned by Playwright version: `baselines-pw-1.48/`, `baselines-pw-1.49/`
+
+**Broken Fixtures** (`tests/fixtures/broken/`):
+- `missing-blob.json`: Session references blob that doesn't exist
+- `timeout-page.html`: Server hangs for 60s to trigger timeouts
+- `unmocked-fetch.js`: Makes request not in recording
+
+#### Test Harness
+
+**Orchestration**:
+- **Vitest** for unit/integration tests (`tests/unit/`, `tests/integration/`)
+- **Custom E2E runner** (`tests/e2e/runner.ts`): Shells out to `eyespy` CLI, parses reports, asserts exit codes
+- **Docker requirement**: E2E tests run in GitHub-provided Ubuntu runner with Docker installed
+
+**CI Matrix**:
+- **Every commit**: US-01 to US-11 (core flows, ~8 min)
+- **Nightly**: US-12 to US-16 (Phase 1b, upgrade scenarios, ~25 min)
+- **Pre-release**: Full suite + performance benchmarks
+
+**Performance Benchmarks** (`tests/perf/`):
+- Replay time: <500ms per action (Docker overhead <2s)
+- Session file size: <50KB per 20 actions
+- Baseline storage: <2MB per 50 sessions
+- Network mock lookup: <5ms per request
+
+#### Directory Structure
+
+```
+tests/
+├── e2e/
+│   ├── us-01-setup.test.ts
+│   ├── us-03-visual-diff.test.ts
+│   ├── us-07-healing.test.ts
+│   └── ... (one file per user story)
+├── fixtures/
+│   ├── sessions/          # Pre-recorded golden sessions
+│   ├── baselines/         # Known-good baseline PNGs (by Playwright version)
+│   ├── broken/            # Intentionally corrupt fixtures
+│   └── mock-api/          # Express server with canned responses
+├── apps/
+│   ├── todomvc-react/     # Standalone test apps
+│   ├── css-in-js/
+│   ├── form-app/
+│   ├── mui-grid/
+│   ├── date-picker/
+│   ├── nextjs-app/        # Phase 1b
+│   ├── random-app/
+│   └── canvas-app/
+├── structural/            # Architecture invariant tests
+│   ├── no-env-leaks.test.ts
+│   ├── replay-determinism.test.ts
+│   └── baseline-versioning.test.ts
+└── perf/
+    └── benchmarks.test.ts
+```
+
+**Structural Invariant Tests**:
+- **No credential leaks**: Asserts `process.env` never serialized to session JSON
+- **Replay determinism**: Same session replayed 10x produces identical screenshots (pixel-perfect)
+- **Baseline versioning**: Asserts `baseline-metadata.json` tracks Playwright version, rejects mismatches
+- **Blob deduplication**: Two identical screenshots share same blob hash
+- **Session size bounds**: Asserts session JSON <100KB, blobs <5MB total per session
+
+---
+
 ## Verification Plan
 
 **Phase 0:**
@@ -3360,3 +3921,98 @@ These tools use AI/ML for "visual AI" diffing instead of pixel comparison. Smart
 | Compression (SDK) | `fflate` (~3KB gz) | — | Tree-shakeable, browser-native fallback |
 | Bundling | `esbuild` (SDK) + `tsup` (Node) | — | Standard toolchain |
 | Size enforcement | `size-limit` | — | Sentry's approach, GitHub Action for PR comments |
+
+---
+
+## References
+
+### Playwright Issues
+- [#38951](https://github.com/microsoft/playwright/issues/38951) — Clock API does not mock `document.timeline.currentTime` (breaks Framer Motion)
+- [#31829](https://github.com/microsoft/playwright/issues/31829) — `--deterministic-mode` enables `--enable-begin-frame-control` which causes `page.screenshot()` to hang indefinitely
+- [#31924](https://github.com/microsoft/playwright/issues/31924) — Clock API fix landed in Playwright 1.48 (required for `clock.install()`)
+- [#33926](https://github.com/microsoft/playwright/issues/33926) — Race condition between `clock.install({ time: T })` and `clock.pauseAt(T)` (clock runs between calls)
+- [#22338](https://github.com/microsoft/playwright/issues/22338) — Catch-all routes that fulfill cause flakiness (does not apply to fallback-only routes)
+- [#37245](https://github.com/microsoft/playwright/issues/37245) — CORS preflights bypass routes
+- [#29596](https://github.com/microsoft/playwright/issues/29596) — Variable fonts (Inter Variable) have known rendering differences in Docker
+
+### Competitor/Prior Art
+- **Meticulous** — VC-funded (~$4M raised, ~$1M ARR as of 2024), closed-source, cloud-only visual regression tool with custom Chromium fork for determinism, record/replay workflow, coverage-based test selection
+- **Chromatic** — Cloud-only ($149+/mo for teams), dominates Storybook visual testing, TurboSnap feature traces Webpack dependency graphs to skip unaffected stories, 7.3B+ tests at scale using vanilla Chrome without BeginFrame control
+- **Lost Pixel** — Open-source visual regression tool, requires manually-written tests, baseline directory per test with sequential numbering (`001-*.png`)
+- **Argos CI** — Open-source visual regression tool, dual-threshold diffing (lenient pass first, strict pass on remainder, reduces compute 60-80%), requires manually-written tests
+- **Pixeleye** — Open-source visual regression tool, requires manually-written tests
+- **Percy** — AI-powered visual testing (commercial)
+- **Applitools** — AI-powered visual testing (commercial)
+- **OpenReplay** — Open-source session replay tool (AGPL), direct `window.fetch` replacement (not Proxy), `Response.clone()` before consuming, worker thread for heavy processing
+- **Highlight.io** — Session replay tool, WebSocket interception via Proxy constructor, batched transport with circuit breaker, 4-hour session window limit
+
+### Core Dependencies
+- **pixelmatch** — Industry-standard image diffing library, operates on raw RGBA pixel buffers, uses YIQ color space for perceptual accuracy, anti-aliasing detection reduces false positives by ~30%
+- **sharp** — Image processing library for PNG → raw RGBA conversion, accepts both file paths and Buffers
+- **commander** — CLI framework (Commander.js), lightweight and standard
+- **ora** — Spinner/progress indicator for indeterminate operations (launching browser), writes to stderr
+- **cli-progress** — Progress bars for deterministic operations (diffing N screenshots), writes to stderr
+- **finder** — MIT-licensed selector generation library for SDK (npm package)
+- **fflate** — Compression library, gzip-only subset ~8-10KB min / ~3KB gz (tree-shakeable), fallback for Safari < 16.4 when CompressionStream API unavailable
+- **esbuild** — Bundler for recorder SDK (IIFE format, ES2020 target), NOT ES5
+- **tsup** — TypeScript bundler for Node packages (replay-engine, diff-engine, test-generator, shared)
+- **size-limit** — Bundle size enforcement tool (Sentry's approach), used with `andresz1/size-limit-action` GitHub Action for PR comments
+- **junit-report-builder** — JUnit XML generation for CI integration (GitHub Actions, GitLab, CircleCI), handles CI quirks
+
+### Phase 2 Dependencies
+- **Fastify** — REST API server framework
+- **Drizzle** — PostgreSQL ORM
+- **PostgreSQL 16** — Database
+- **BullMQ** — Job queue with Redis
+- **Redis** — Cache and queue backend
+- **React 19** — Dashboard UI framework
+- **Vite** — Frontend build tool
+- **Vitest** — Test runner (fast, Vite-native)
+
+### External Documentation & Tools
+
+#### Browser/Platform
+- **Playwright >= 1.48** — Minimum version required for `clock.install()` with #31924 fix, `routeWebSocket()`, and `animations: 'disabled'` screenshot option
+- **Docker** — Official Playwright Docker image (`mcr.microsoft.com/playwright:v1.50.0-noble`) mandatory for CI, uses new headless mode (Playwright 1.33+)
+- **Chromium 133.0.6943.16** — Browser version in Playwright 1.50.0
+- **ES2020** — SDK compilation target, covers Chrome 80+/Firefox 80+/Safari 14+
+
+#### Related Tools & Patterns
+- **rrweb** — Session replay library, uses numeric node IDs for DOM mirroring (40-50KB min core), wrong model for eyespy's selector-based replay
+- **Sentry** — Error tracking tool with 10K mutation/10s throttle, breadcrumb model for event buffering, direct `window.fetch` replacement (100K+ lines)
+- **PostHog** — Privacy-first analytics with opt-in recording, mask all inputs by default, `data-ph-no-capture` attribute
+- **v8-to-istanbul** — Coverage conversion tool (V8 byte ranges → Istanbul format), eyespy skips Istanbul format entirely and goes straight to bitmaps
+- **c8** — Code coverage tool using V8 coverage data
+- **reg-suit** — Visual regression tool with pluggable storage architecture (inspiration for eyespy's storage interface)
+- **@storybook/test-runner** — Playwright-based Storybook test runner (peer dependency for Phase 3 Storybook integration)
+
+#### Cloud Storage Backends
+- **AWS S3** — S3-compatible object storage
+- **Cloudflare R2** — S3-compatible object storage
+- **MinIO** — S3-compatible object storage (self-hosted)
+- **Backblaze B2** — S3-compatible object storage
+
+#### CI/CD Integrations
+- **GitHub Actions** — `dorny/test-reporter@v1` for JUnit XML reporting, `andresz1/size-limit-action` for bundle size PR comments
+- **GitLab CI** — Requires `<testsuites>` wrapper for JUnit XML (won't parse bare `<testsuite>`)
+- **CircleCI** — JUnit XML support
+
+#### Frameworks & Libraries Referenced
+- **React 18+** — Uses `MessageChannel` timing for concurrent scheduler, `useId()` for deterministic component IDs
+- **Next.js 14** — SSR hydration, React Server Components, streaming HTML
+- **Framer Motion** — Animation library broken by missing `document.timeline.currentTime` mock
+- **TodoMVC** — Reference implementation for Phase 0 PoC validation
+- **Webpack** — Bundler (Chromatic's TurboSnap traces Webpack module dependency graphs)
+
+#### Monorepo Tooling
+- **pnpm** — Package manager with workspaces
+- **Turborepo** — Monorepo build orchestrator
+- **Biome** — Linter/formatter
+
+#### Standards & Protocols
+- **CompressionStream API** — Zero-cost browser-native compression (Safari 16.4+)
+- **V8 Profiler** — JavaScript code coverage API (`page.coverage` in Playwright, Chromium-only)
+- **CDP (Chrome DevTools Protocol)** — `HeadlessExperimental.beginFrame` commands required by `--deterministic-mode`
+- **CORS** — OPTIONS preflights, `Access-Control-Allow-*` headers
+- **WebSocket** — Real-time protocol, mocked via `page.routeWebSocket()` in Playwright 1.48+
+- **Server-Sent Events (SSE)** — Real-time protocol, mocked via `addInitScript()` EventSource replacement
